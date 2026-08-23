@@ -8,6 +8,18 @@ namespace TrainTimetable.Engine;
 /// (moi Section duoc kiem tra tren occupation cua moi CycleIndex trong cua so [-K,K], muc 5.1/11.3) -
 /// KHONG co phien ban "chi trong ngay" tach rieng. Chua sinh OVERTAKE (viec cua ConflictAnalyzer, Phase
 /// 6, muc 5.4) va chua resolve gi ca - day thuan la detection.
+///
+/// KHONG tu sinh SectionOccupation - nhan tu SectionOccupationBuilder (da loc dung, chi chua physical
+/// traversal). Lop nay vi vay KHONG can biet ga nao la ga nhanh/terminal (Qui Nhon, Phan Thiet...) -
+/// toan bo semantic do nam o SectionOccupationBuilder, dung mot cho duy nhat (muc 15.9).
+///
+/// QUAN TRONG (sua sau review - muc 1.4/15.14): moi TrainService nhan RailwayNetwork CUA RIENG NO khi
+/// goi Detect - KHONG dung chung 1 network cho moi service. Ly do: StationSequence chi co y nghia CUC
+/// BO trong route cua chinh 1 TrainService (muc 1.4) - 2 service co the dung cung mot so Sequence de
+/// tro toi 2 StationCode vat ly hoan toan khac nhau. Danh tinh dung chung giua cac tau duy nhat la
+/// Section.SectionId (phai duoc nguoi xay network suy tu cap StationCode that, KHONG tu Sequence, KHONG
+/// chua TrainCode - muc 1.4) - ConflictDetector chi so sanh occupation theo dung SectionId nay, khong
+/// bao gio tu minh tra Section qua mot network "dung chung".
 /// </summary>
 public sealed class ConflictDetector
 {
@@ -21,8 +33,7 @@ public sealed class ConflictDetector
     }
 
     public IReadOnlyList<Conflict> Detect(
-        IReadOnlyList<(TrainService Service, TrainServiceTrajectory Trajectory)> services,
-        RailwayNetwork network)
+        IReadOnlyList<(TrainService Service, TrainServiceTrajectory Trajectory, RailwayNetwork Network)> services)
     {
         if (services.Count == 0)
         {
@@ -30,14 +41,13 @@ public sealed class ConflictDetector
         }
 
         var cyclicRadius = ComputeCyclicRadius(services);
-        var sectionsById = network.Sections.ToDictionary(s => s.SectionId);
 
         var occupationsBySection = new Dictionary<string, List<SectionOccupation>>();
-        foreach (var (service, trajectory) in services)
+        foreach (var (service, trajectory, network) in services)
         {
             for (var cycleIndex = -cyclicRadius; cycleIndex <= cyclicRadius; cycleIndex++)
             {
-                foreach (var occupation in BuildOccupationsForCycle(service, trajectory, network, cycleIndex))
+                foreach (var occupation in SectionOccupationBuilder.BuildForCycle(service, trajectory, network, cycleIndex))
                 {
                     if (!occupationsBySection.TryGetValue(occupation.SectionId, out var list))
                     {
@@ -53,8 +63,7 @@ public sealed class ConflictDetector
         var conflicts = new List<Conflict>();
         foreach (var (sectionId, occupations) in occupationsBySection)
         {
-            var section = sectionsById[sectionId];
-            conflicts.AddRange(DetectWithinSection(section, occupations));
+            conflicts.AddRange(DetectWithinSection(sectionId, occupations));
         }
 
         return conflicts
@@ -68,7 +77,7 @@ public sealed class ConflictDetector
     /// ke nhau theo EntryTime (muc 5.4/5.5). Do phuc tap: O(n log n) sort + O(n x |active|) so sanh, voi
     /// |active| trong thuc te nho vi headway chi 3 phut.
     /// </summary>
-    private IEnumerable<Conflict> DetectWithinSection(Section section, List<SectionOccupation> occupations)
+    private IEnumerable<Conflict> DetectWithinSection(string sectionId, List<SectionOccupation> occupations)
     {
         occupations.Sort((x, y) => x.EntryTimeMinutes.CompareTo(y.EntryTimeMinutes));
         var headway = _headwayRules.SectionReleaseHeadwayMinutes;
@@ -85,9 +94,13 @@ public sealed class ConflictDetector
                     continue;
                 }
 
-                if (section.NumberOfTracks >= 2 && earlier.Direction != later.Direction)
+                // Ngoai le double-track (muc 5.3): CA HAI occupation phai dong y day la double-track -
+                // neu lech nhau (vd network cua 1 service bao sai), mac dinh AN TOAN la coi nhu single
+                // track (van bao MEET) thay vi bo qua nham mot conflict that.
+                if (Math.Min(earlier.NumberOfTracks, later.NumberOfTracks) >= 2
+                    && earlier.Direction != later.Direction)
                 {
-                    continue; // ngoai le double-track, muc 5.3 - chua co track assignment nen bo qua MEET
+                    continue; // chua co track assignment nen bo qua MEET ngang chieu tren double-track
                 }
 
                 var actualGap = later.EntryTimeMinutes - earlier.ExitTimeMinutes;
@@ -96,7 +109,7 @@ public sealed class ConflictDetector
                     continue;
                 }
 
-                yield return BuildConflict(section.SectionId, earlier, later, actualGap, headway);
+                yield return BuildConflict(sectionId, earlier, later, actualGap, headway);
             }
 
             active.Add(later);
@@ -127,30 +140,8 @@ public sealed class ConflictDetector
         };
     }
 
-    private static IEnumerable<SectionOccupation> BuildOccupationsForCycle(
-        TrainService service, TrainServiceTrajectory trajectory, RailwayNetwork network, int cycleIndex)
-    {
-        var shift = cycleIndex * TrainService.CycleLengthMinutes;
-        for (var i = 0; i < trajectory.Entries.Count - 1; i++)
-        {
-            var from = trajectory.Entries[i];
-            var to = trajectory.Entries[i + 1];
-            var section = network.GetSectionBetween(from.StationSequence, to.StationSequence);
-
-            yield return new SectionOccupation
-            {
-                SectionId = section.SectionId,
-                ServiceId = service.ServiceId,
-                CycleIndex = cycleIndex,
-                Direction = service.Direction,
-                EntryTimeMinutes = from.DepartureTimeMinutes!.Value + shift,
-                ExitTimeMinutes = to.ArrivalTimeMinutes!.Value + shift
-            };
-        }
-    }
-
     private static int ComputeCyclicRadius(
-        IReadOnlyList<(TrainService Service, TrainServiceTrajectory Trajectory)> services)
+        IReadOnlyList<(TrainService Service, TrainServiceTrajectory Trajectory, RailwayNetwork Network)> services)
     {
         var maxJourneyTime = services.Max(s => s.Service.JourneyTimeMinutes);
         return 1 + (int)Math.Ceiling(maxJourneyTime / (double)TrainService.CycleLengthMinutes);

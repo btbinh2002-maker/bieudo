@@ -166,4 +166,62 @@ public class MinimumTimetableBuilderTests
         Assert.Equal(3150, service.FixedArrivalTimeMinutes); // 1200 + 1950, KHONG mod 1440
         Assert.Equal(1200 + 139, trajectory.Last.ArrivalTimeMinutes); // giong tay tinh o tren, chi doi moc xuat phat
     }
+
+    // Test F (thiet ke muc 15.9): tau BYPASS mot ga nhanh - khu gian giua co MinRunningTime=0 (dong
+    // logic van ton tai trong JourneySequence nhung khong ranh vao nhanh that). MinimumJourneyTime
+    // KHONG duoc cong them bat ky accel/decel/stop nao cho ga nhanh do - phai dung bang tong 2 khu gian
+    // thuc (10+10=20), khong phai 20 + accel/decel "gia" cho ga giua.
+    [Fact]
+    public void Build_ZeroRunningTimeThroughStation_AddsNoAccelerationDecelerationOrStopTime()
+    {
+        var stations = new List<Station>
+        {
+            BypassStation(1), BypassStation(2), BypassStation(3), BypassStation(4)
+        };
+        var sections = new List<Section>
+        {
+            BypassSection(1, 2, running: 10),
+            BypassSection(2, 3, running: 0), // "ga nhanh ao" - tau nay khong re vao
+            BypassSection(3, 4, running: 10)
+        };
+        var network = new RailwayNetwork(stations, sections);
+
+        var service = new TrainService(
+            serviceId: "BYPASS", trainCode: "BYPASS", direction: Direction.Inbound,
+            originStationSequence: 1, destinationStationSequence: 4,
+            fixedDepartureTimeOfDayMinutes: 0, journeyTimeMinutes: 25, priority: 1,
+            stopRequirements: new List<TrainStopRequirement>());
+
+        var trajectory = _builder.Build(service, network);
+
+        var station2 = trajectory.GetEntry(2);
+        var station3 = trajectory.GetEntry(3);
+        // Diem mau chot: KHONG co accel/decel "gia" quanh chinh khu gian bypass (KG2-3) - station2
+        // khong giam toc de "dung" o day (no khong dung), station3 khong tang toc tu mot lan dung
+        // truoc do (khong co lan dung nao ca). Day la 2 assertion true chung minh bypass dung.
+        Assert.False(station2.DecelerationApplied);
+        Assert.False(station3.AccelerationApplied);
+        Assert.Equal(0, station3.StopDurationMinutes);
+        Assert.Equal(0, station3.RunningTimeFromPrevMinutes); // dung bang MinRunningTime=0, khong bi cong gi them
+
+        // MinimumJourneyTime = 10+accel(2, xuat phat) [KG1-2] + 0 [KG2-3, bypass, KHONG accel/decel] +
+        // 10+decel(1, la destination) [KG3-4] = 23. Accel o KG1-2 va decel o KG3-4 la penalty CHUAN cho
+        // moi hanh trinh (xuat phat/den), khong lien quan gi den bypass - neu bypass sai, con so nay se
+        // LON HON 23 (vd 25 neu bi cong nham +2 hoac +1 quanh ga nhanh ao).
+        Assert.Equal(23, trajectory.Last.ArrivalTimeMinutes);
+    }
+
+    private static Station BypassStation(int seq) => new()
+    {
+        StationId = $"BP{seq}", Code = $"BP{seq}", Name = $"BP{seq}", Sequence = seq,
+        Tracks = new List<StationTrack> { new($"BP{seq}-T1", TrackType.MainThrough, false, false) }
+    };
+
+    private static Section BypassSection(int from, int to, int running) => new()
+    {
+        SectionId = $"BPKG{from}-{to}",
+        FromStationSequence = from,
+        ToStationSequence = to,
+        MinRunningTimeMinutes = new Dictionary<Direction, int> { [Direction.Inbound] = running, [Direction.Outbound] = running }
+    };
 }

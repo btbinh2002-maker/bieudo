@@ -176,6 +176,14 @@ Section
 mà không cần đổi kiến trúc ConflictDetector — chỉ cần điều kiện MEET-conflict thêm
 `Section.NumberOfTracks < 2`.
 
+> **Ngoại lệ đã xác nhận với dữ liệu thật (2026-08-23, xem mục 15.13):** mô hình "một tuyến tuyến tính"
+> (mục 0) đúng cho hầu hết mạng lưới, NHƯNG có đúng 2 điểm ngoại lệ đã biết — Qui Nhơn và Phan Thiết —
+> là **ga nhánh/terminal** (nhánh cụt, không phải điểm đi qua). Một `TrainService` chỉ thực sự chiếm
+> dụng Section dẫn vào nhánh đó nếu chính nó xuất phát hoặc kết thúc tại ga nhánh; các tàu khác chạy
+> thẳng qua khu vực này trên tuyến chính, không "physical traversal" nhánh dù dữ liệu nguồn vẫn có dòng
+> logic đi qua đó (mục 15.13). Đây là lý do mục 1.6/5.1 dưới đây phải phân biệt rõ "logical journey
+> row" và "physical section traversal" — không còn coi 2 khái niệm này là một.
+
 ### 1.3 Direction
 
 ```text
@@ -211,11 +219,45 @@ TrainStopRequirement
   StopDurationOverride?: int   // nếu ga này có quy định thời gian dừng riêng khác default
 ```
 
-`TrainService.Route` (danh sách ga đi qua) không lưu tường minh — suy ra trực tiếp từ
-`[OriginStationSeq .. DestinationStationSeq]` theo `Direction` (đây là tuyến tuyến tính nên route luôn
-là một đoạn liên tục các ga theo thứ tự `Sequence`). Ga nào không có trong `StopRequirements` → tàu
-chạy thông qua (default, đúng mục 3 của đề bài). `StopRequirements` áp dụng **giống hệt cho mọi
-instance** — pattern lặp lại mỗi ngày như nhau, đúng giả định steady-state của bài toán.
+> **Sửa lại (2026-08-23, sau khi dữ liệu thật xác nhận ngoại lệ Qui Nhơn/Phan Thiết — mục 15.13.5):**
+> bản nháp trước nói route luôn là **một đoạn liên tục của `Sequence` trên MỘT network dùng chung cho
+> mọi tàu** — điều này mâu thuẫn với dữ liệu thật: Qui Nhơn/Phan Thiết không thể có một vị trí
+> `Sequence` vừa đúng cho tàu bypass vừa đúng cho tàu thật sự đi/đến đó trên cùng một trục tăng/giảm
+> dần duy nhất. Route **không còn được suy ra** từ một khoảng `Sequence` toàn cục nữa — xem model đúng
+> ngay dưới đây.
+
+`TrainService.Route` (danh sách ga đi qua) **không lưu tường minh và không suy ra từ một khoảng
+`Sequence` liên tục trên network toàn cục.** Model đúng: `Route` được xác định trực tiếp từ **danh sách
+journey row đã sắp xếp CỦA CHÍNH `TrainService` đó** (ánh xạ 1:1 vào `TrainServiceTrajectory`/
+`TimetableEntry`, mục 1.5) — không suy diễn từ nơi khác. Phân biệt rõ 2 khái niệm:
+
+```text
+StationCode      — định danh ga VẬT LÝ/logical node, DÙNG CHUNG và ổn định qua mọi TrainService
+                   (vd mã ga trong bảng hành trình thật, mục 15.1)
+JourneySequence  — CHỈ xác định THỨ TỰ của ga đó TRONG HÀNH TRÌNH CỦA CHÍNH TrainService này — LOCAL,
+                   đánh số 1..N riêng cho từng service, KHÔNG phải một toạ độ trên một trục Sequence
+                   dùng chung toàn mạng lưới
+```
+
+`OriginStationSeq`/`DestinationStationSeq` (và `Sequence` dùng trong
+`RailwayNetwork.GetStationSequencesOnRoute`, mục 1.2) vì vậy phải hiểu là **toạ độ cục bộ trong phạm vi
+route của CHÍNH `TrainService` đó** — `RailwayNetwork` truyền vào `MinimumTimetableBuilder` cho một
+service có thể (và nên, khi code Phase 2.5 thật) là một fragment riêng cho service đó, **không bắt buộc
+là một network toàn cục duy nhất chia sẻ giữa tất cả service**. Điều này **không đòi hỏi đổi code đã
+commit** — `RailwayNetwork.GetStationSequencesOnRoute` (đã có, `src/TrainTimetable.Domain/
+RailwayNetwork.cs`) chỉ enumerate một dải số nguyên liên tục, tương thích sẵn với cách hiểu "cục bộ"
+này mà không cần biết network đó là toàn cục hay theo-từng-service.
+
+Danh tính dùng để SO SÁNH giữa các `TrainService` **khác nhau** (vd "tàu A và tàu B có đi qua cùng một
+khu gian vật lý không", dùng cho `ConflictDetector`) **không** dựa vào `Sequence` (vì nó chỉ có ý nghĩa
+cục bộ trong route của một service) — phải dùng `SectionId`, suy ra từ **cặp `StationCode` vật lý
+thật** (mục 15.13.5), và `SectionId` **tuyệt đối không được chứa `TrainCode`** — nếu lẫn vào, mọi
+Section của mọi tàu sẽ khác nhau và `ConflictDetector` sẽ không bao giờ tìm thấy conflict nào (lỗi im
+lặng).
+
+Ga nào không có trong `StopRequirements` → tàu chạy thông qua (default, đúng mục 3 của đề bài).
+`StopRequirements` áp dụng **giống hệt cho mọi instance** — pattern lặp lại mỗi ngày như nhau, đúng giả
+định steady-state của bài toán.
 
 ```text
 TrainInstance   // KHÔNG phải class lưu trữ — chỉ là hàm/struct tính toán tại chỗ (computed view)
@@ -262,18 +304,33 @@ lưu thêm bản sao nào).
 
 ```text
 SectionOccupation
-  SectionId
+  SectionId           // danh tính DÙNG CHUNG giữa các TrainService — suy từ cặp StationCode vật lý
+                       // thật (mục 1.4), KHÔNG bao giờ từ StationSequence hay TrainCode
   ServiceId
   CycleIndex          // instance nào sinh ra occupation này (0, ±1, ±2, ... theo cửa sổ K, mục 11)
   Direction
   EntryTime   = TrainInstance(ServiceId, CycleIndex).Departure(ga đầu khu gian)
   ExitTime    = TrainInstance(ServiceId, CycleIndex).Arrival(ga cuối khu gian)
+  NumberOfTracks      // mang theo từ Section của network riêng của CHÍNH service này (mục 15.14) — để
+                       // ConflictDetector không cần tra lại qua một network dùng chung
 ```
 
 Occupation luôn được sinh **theo instance** (có `CycleIndex`) chứ không theo service trực tiếp, vì bản
 thân hiện tượng chiếm dụng khu gian là một sự kiện vật lý tại một thời điểm tuyệt đối cụ thể — một
 `TrainService` chạy hàng ngày sẽ sinh ra nhiều `SectionOccupation` cho cùng một `SectionId` (một cho mỗi
 `CycleIndex` còn nằm trong cửa sổ quan sát).
+
+> **Sửa lại (2026-08-23, sau khi xác nhận ngoại lệ Qui Nhơn/Phan Thiết — mục 15.13, đã code
+> `SectionOccupationBuilder`):** **không phải mọi cặp `TimetableEntry` liên tiếp trong trajectory (mục
+> 1.5) đều sinh ra một `SectionOccupation`.** Một cặp liên tiếp chỉ sinh occupation nếu có **physical
+> traversal thật** — tức `ExitTime > EntryTime` (thời lượng thực > 0). Nếu `ExitTime == EntryTime`
+> (thời lượng = 0), KHÔNG sinh occupation cho cặp đó, bất kể nguyên nhân gây ra con số 0 là gì —
+> `SectionOccupation` KHÔNG hard-code biết về Qui Nhơn/Phan Thiết hay bất kỳ ga nhánh cụ thể nào, nó chỉ
+> áp đúng MỘT quy tắc chung này (mục 15.13). Đây là điểm mấu chốt phân biệt **logical journey row**
+> (mọi dòng trong `TrainServiceTrajectory`, kể cả dòng đi qua ga nhánh mà tàu không thực sự rẽ vào) với
+> **physical section traversal** (chỉ những dòng tàu THỰC SỰ chiếm dụng resource vật lý). Lưu ý:
+> `ExitTime > EntryTime` ở đây là **defensive invariant** tại tầng occupation, KHÔNG phải nơi quyết định
+> chính "row nào là bypass" — quyết định đó xảy ra sớm hơn, ở bước validate input (mục 15.13.2/15.13.4).
 
 ### 1.7 Conflict
 
@@ -536,10 +593,18 @@ cục bộ.
 
 ### 5.1 Section occupation
 
-Sinh từ `TrainInstance` (mục 1.4/1.6), không trực tiếp từ `TrainService`: với mỗi `ServiceId` và mỗi
+Sinh từ `TrainInstance` (mục 1.4/1.6), không trực tiếp từ `TrainService`, bởi `SectionOccupationBuilder`
+(đã code — `src/TrainTimetable.Engine/SectionOccupationBuilder.cs`): với mỗi `ServiceId` và mỗi
 `CycleIndex` còn nằm trong cửa sổ chu kỳ `[-K, K]` (mục 11), mỗi cặp `(TimetableEntry[i], TimetableEntry[i+1])`
-của `TrainServiceTrajectory` (dịch `+CycleIndex×1440`) sinh
-1 `SectionOccupation { SectionId, ServiceId, CycleIndex, Direction, EntryTime, ExitTime }`. Nói cách khác,
+của `TrainServiceTrajectory` (dịch `+CycleIndex×1440`) **CÓ THỂ** sinh 1
+`SectionOccupation { SectionId, ServiceId, CycleIndex, Direction, EntryTime, ExitTime }` — **chỉ khi**
+`ExitTime > EntryTime` (physical traversal thật, mục 1.6/15.13). Cặp nào có `ExitTime == EntryTime`
+(logical row đi qua ga nhánh mà tàu không thực sự rẽ vào — mục 15.13) **không sinh occupation**.
+`SectionOccupationBuilder` không hard-code biết ga nào là ga nhánh; nó chỉ áp đúng điều kiện thời lượng
+này như một **defensive invariant** (`ExitTime < EntryTime` → throw ngay, không silent-skip) — quyết
+định "logical row nào là bypass hợp lệ" đã xảy ra sớm hơn, ở bước validate input (mục 15.13.2/15.13.4),
+không phải ở đây.
+
 `ConflictDetector` **luôn chạy ở "chế độ cyclic"** ngay từ Phase 3 — không có một phiên bản "chỉ trong
 ngày" tách riêng rồi mở rộng sau; xem mục 11 để biết cách giới hạn `K` sao cho vẫn hiệu quả.
 
@@ -656,8 +721,11 @@ foreach Section S:
     sort occupations theo EntryTime
     foreach cặp (Earlier, Later) KỀ NHAU theo EntryTime (và các cặp gần kề khác có thể còn vi phạm — xem
                                                           ghi chú độ phức tạp mục 5.4):
-        if S.NumberOfTracks >= 2 and Earlier.Direction != Later.Direction:
-            continue                                    // ngoại lệ double-track, mục 5.3
+        // NumberOfTracks lay tu CHINH occupation (Earlier/Later.NumberOfTracks, mang theo tu luc build -
+        // muc 15.14), KHONG tra qua mot RailwayNetwork dung chung nao ca:
+        if min(Earlier.NumberOfTracks, Later.NumberOfTracks) >= 2 and Earlier.Direction != Later.Direction:
+            continue                                    // ngoại lệ double-track, mục 5.3 (dùng min để
+                                                          // an toàn nếu 2 network của 2 service lệch nhau)
 
         ActualGapMinutes := Later.EntryTime - Earlier.ExitTime
         if ActualGapMinutes >= SectionReleaseHeadwayMinutes:
@@ -1593,7 +1661,17 @@ luận một cách phân bổ recovery ban đầu khác 0**. Hệ quả biểu d
   một quyết định của `BufferAllocator` cần **thêm thông tin ngoài bảng hành trình** (xem mục 15.9), Phase
   2.5 (mapping layer thuần túy) không tự ý làm việc đó.
 
-### 15.7 Validate & dedupe `MinimumRunningTimeToNextStation` → `Section` (yêu cầu chính, không đổi so với bản trước)
+### 15.7 Validate & dedupe `MinimumRunningTimeToNextStation` → `Section` (yêu cầu chính)
+
+> **Sửa lại (2026-08-23, sau khi xác nhận ngoại lệ Qui Nhơn/Phan Thiết — mục 15.13):** phải **loại trừ**
+> quan sát có `MinRunningTime == 0` tại các cặp đã xác nhận là branch/bypass link (mục 15.13) ra khỏi
+> phép so sánh uniformity dưới đây **TRƯỚC KHI** gom nhóm — `0` (bypass) và giá trị dương (branch thật,
+> vd 10 phút) tại cùng cặp ga không phải "hai giá trị running-time mâu thuẫn cần
+> `ISectionRunningTimeResolver`", mà là khác biệt ngữ nghĩa route hợp lệ (mục 15.13) đã biết trước. Áp dụng bước lọc này thì
+> profiling dữ liệu thật (2026-08-23) cho kết quả: **0/350 (Section,Direction) không-uniform** — tức là
+> với dữ liệu đã làm sạch, quy tắc dedupe gốc dưới đây gần như không bao giờ phải xử lý nhánh
+> "khác nhau thật" nữa; mục 15.8 (`ISectionRunningTimeResolver`) vẫn giữ nguyên ở trạng thái "chưa cần
+> code" (đúng phân công cũ) trên network hiện tại.
 
 Với mọi cặp liên tiếp `(r_i, r_{i+1})` của **mọi** `TrainCode`, gom thành 1 quan sát:
 
@@ -1601,10 +1679,16 @@ Với mọi cặp liên tiếp `(r_i, r_{i+1})` của **mọi** `TrainCode`, gom
 (SectionKey = (min(FromSeq,ToSeq), max(FromSeq,ToSeq)), Direction, TrainCode, MinRunningTime)
 ```
 
-rồi group theo `(SectionKey, Direction)`:
+**Lọc trước khi gom nhóm:** bỏ mọi quan sát có `MinRunningTime == 0` MÀ `SectionKey` thuộc danh sách
+branch/bypass link đã cấu hình (mục 15.13, `BranchStationRule`) — các quan sát này không tham gia phép
+so sánh uniformity (chúng biểu diễn "không có physical traversal", không phải "running time = 0 phút").
+`MinRunningTime == 0` ở bất kỳ `SectionKey` nào **KHÔNG** thuộc danh sách này vẫn là lỗi dữ liệu cần báo
+(mục 15.13, quy tắc validate riêng) — bước lọc ở đây không "tha" cho trường hợp đó.
+
+Sau khi lọc, group theo `(SectionKey, Direction)`:
 
 ```text
-foreach group in observations.GroupBy(SectionKey, Direction):
+foreach group in filteredObservations.GroupBy(SectionKey, Direction):
     distinctValues := group.Select(MinRunningTime).Distinct()
     if distinctValues.Count == 1:
         # NHẤT QUÁN giữa mọi tàu cùng khu gian + cùng chiều → dedupe an toàn
@@ -1766,3 +1850,189 @@ lại cho khớp với những gì **đã thực sự implement** ở Phase 2 (�
 - **Chưa** code `ISectionRunningTimeResolver` (mục 15.8) cho tới khi 15.7 xác nhận thực sự cần.
 - **Chưa** code DB integration (đọc bảng hành trình thật / ghi output thật) hay bất kỳ phần nào của
   Phase 3 — mục 15 hiện tại vẫn thuần là spec/thiết kế.
+
+### 15.13 Ngoại lệ ga nhánh/terminal — Qui Nhơn, Phan Thiết (chốt 2026-08-23, sau real data profiling)
+
+Xác nhận từ dữ liệu thật (`Bieudo_AI.dbo.HanhTrinh`) và nghiệp vụ: trên tuyến hiện tại có **đúng 2 ga
+nhánh/terminal** — **Qui Nhơn** và **Phan Thiết**. Đây là nhánh cụt (dead-end spur), không phải điểm đi
+qua. Chỉ `TrainService` nào **xuất phát hoặc kết thúc** tại 1 trong 2 ga này mới thực sự chạy vào/ra
+nhánh; mọi tàu khác chạy thẳng qua khu vực junction trên tuyến chính, **không** rẽ vào.
+
+**Bằng chứng từ dữ liệu thật:** raw `HanhTrinh` vẫn giữ đủ dòng logic đi qua khu vực này cho MỌI tàu (để
+giữ cấu trúc dữ liệu đồng nhất), nhưng với tàu không rẽ vào nhánh, các dòng đó có
+`MinimumRunningTimeToNextStation = 0` liên tiếp (đã verify: chuỗi `[ga ảo Bắc] → [ga nhánh thật] → [ga ảo
+hoặc ga thật Nam]`, tất cả `Arrival == Departure`, `Pax=Tech=0`). Với tàu thực sự đi/đến ga nhánh, ga ảo
+**không xuất hiện** trong dòng dữ liệu của tàu đó, và running time giữa ga nhánh với ga liền kề thật là
+số dương (vd 10 phút). `0` ở đúng những dòng bypass này là **dữ liệu hợp lệ**, không phải lỗi.
+
+#### 15.13.1 `BranchStationRule` — nơi DUY NHẤT chứa semantic "ga nào là ga nhánh"
+
+```text
+BranchStationRule
+  StationCode: int          // mã ga nhánh thật (vd Qui Nhơn, Phan Thiết) — KHÔNG phải mã ga ảo
+  BypassChainStationCodes: IReadOnlyList<int>
+                              // toàn bộ mã ga (ảo + thật liền kề) xuất hiện trong chuỗi bypass quanh
+                              // ga nhánh này, vd [31180, 3180, 3118] cho Qui Nhơn — dùng để xác định
+                              // đúng những cặp (From,To) nào được PHÉP có MinRunningTime=0
+```
+
+Đây là cấu hình (Configuration/Phase 2.5), **không phải** một field mới trên `Domain` (`Station`/
+`Section` đã commit **không cần đổi**) — xem lý do ở mục 15.13.4. Đây là **một chỗ duy nhất** biết
+"Qui Nhơn/Phan Thiết là gì"; mọi lớp khác (`MinimumTimetableBuilder`, `SectionOccupationBuilder`,
+`ConflictDetector`) không được và không cần biết.
+
+#### 15.13.2 Validate `MinimumRunningTimeToNextStation = 0` (bổ sung mục 15.7)
+
+```text
+0 tại cặp (From,To) THUỘC BypassChainStationCodes của một BranchStationRule đã cấu hình
+    => hợp lệ (bypass), không phải lỗi
+
+0 tại cặp (From,To) KHÔNG thuộc bất kỳ BranchStationRule nào
+    => LỖI DỮ LIỆU (validation error) — báo rõ TrainCode, JourneySequence, (From,To)
+       KHÔNG được tự "chấp nhận" 0 tuỳ tiện ở section tuyến chính
+```
+
+(Tương ứng test D, mục 15.13.6 — hiện tại spec, chưa có code vì `TimetableSourceRow`/validator Phase 2.5
+chưa được implement.)
+
+#### 15.13.3 `MinimumTimetableBuilder` — ĐÃ ĐÚNG, không cần sửa code
+
+Rà soát lại code đã commit (`src/TrainTimetable.Engine/MinimumTimetableBuilder.cs`): với một ga bypass
+(`willStop=false` vì không phải origin/destination và không có `TrainStopRequirement` — đúng vì
+`PassengerStopMinutes=TechnicalStopMinutes=0` tại các dòng này, mục 15.5),
+`decelerationApplied=willStop=false` và `accelerationApplied=previousWasStopped` (chỉ phụ thuộc ga
+TRƯỚC có dừng hay không, không liên quan gì đến bản thân ga bypass). Nếu `MinRunningTime=0` và ga liền
+trước cũng không dừng, `runningTime = 0 + 0 + 0 = 0` — đúng, không cộng accel/decel/stop giả. Điều này
+**đã được test bằng regression test thật**
+(`MinimumTimetableBuilderTests.Build_ZeroRunningTimeThroughStation_AddsNoAccelerationDecelerationOrStopTime`
+— test F, mục 15.13.6), không chỉ suy luận trên giấy. **Kết luận: không cần sửa `MinimumTimetableBuilder`.**
+
+#### 15.13.4 Pipeline đúng — `ExitTime > EntryTime` là defensive invariant, KHÔNG phải cơ chế chính
+
+> **Làm rõ lại (2026-08-23, sau review lần 2):** bản nháp trước để `SectionOccupationBuilder` (qua điều
+> kiện `ExitTime > EntryTime`) làm cơ chế **chính** để phát hiện bypass — dễ hiểu nhầm rằng đây là nơi
+> "quyết định" logical vs physical. **Sai vị trí trách nhiệm.** Việc quyết định một dòng logic có phải
+> bypass hợp lệ hay không **phải xảy ra sớm hơn, ở bước validate input** (mục 15.13.2, dùng
+> `BranchStationRule`) — TRƯỚC khi trajectory được dựng. Pipeline đúng:
+
+```text
+Raw HanhTrinh
+      |
+      v
+Input validation + BranchStationRule     <- QUYET DINH logical/bypass vs physical O DAY
+      |                                     (MinRun=0 CHI hop le tai bypass chain da cau hinh;
+      |                                      MinRun=0 o section tuyen chinh => FAIL validation)
+      v
+Build trajectory (MinimumTimetableBuilder)  <- nhan input DA validate, khong tu quyet dinh gi them
+      |
+      v
+SectionOccupationBuilder                    <- CHI ap 1 defensive invariant (duoi day), KHONG phai
+                                                noi "phat hien" bypass
+```
+
+Vì input đã được validate TRƯỚC khi tới `SectionOccupationBuilder`, lớp này khi nhận trajectory có thể
+**giả định** `MinRunningTime = 0` (nếu có) đã hợp lệ. `ExitTime > EntryTime` ở đây chỉ còn là một
+**defensive invariant** ở tầng occupation — bảo vệ chống lỗi lập trình/dữ liệu bất ngờ ở bước trước, chứ
+không phải nơi "che" hay "sửa" input sai:
+
+```text
+ExitTime >  EntryTime   => sinh SectionOccupation binh thuong (co physical traversal)
+ExitTime == EntryTime   => KHONG sinh occupation (bypass da qua validate hop le tu truoc)
+ExitTime <  EntryTime   => KHONG silent-skip - day la invariant violation (thoi luong am KHONG THE
+                            la bypass hop le, vi bypass hop le luon cho dung 0) => THROW ngay (fail
+                            fast), khong che dau mot loi that su co the nam o buoc validate/trajectory
+```
+
+Đã sửa code đúng theo pipeline này: `ConflictDetector` (trước review) sinh **vô điều kiện** 1
+`SectionOccupation` cho mọi cặp `TimetableEntry` liên tiếp — kể cả cặp bypass (thời lượng 0). Đã tách
+logic sinh occupation ra lớp riêng `SectionOccupationBuilder`
+(`src/TrainTimetable.Engine/SectionOccupationBuilder.cs`), áp đúng 3 nhánh invariant ở trên (`< 0` →
+throw `InvalidOperationException`, `== 0` → skip, `> 0` → sinh occupation). Lớp này **không hard-code**
+Qui Nhơn/Phan Thiết hay bất kỳ `StationCode` nào. `ConflictDetector` gọi
+`SectionOccupationBuilder.BuildForCycle(...)` thay vì tự sinh, và **không đổi gì khác** trong logic phát
+hiện conflict (mục 5.2–5.6 vẫn nguyên vẹn).
+
+#### 15.13.5 Vì sao KHÔNG cần domain model general graph
+
+`Domain` (`Station`, `Section`, `SectionOccupation`, `Conflict` — đã commit) **không cần thêm field
+nào**. Toàn bộ semantic nằm ở 2 chỗ: (a) `BranchStationRule` (Configuration/Phase 2.5, dùng lúc validate
+input — mục 15.13.2), (b) 3 nhánh invariant ở mục 15.13.4 trong `SectionOccupationBuilder` (tổng quát,
+không cần biết branch). Không cần biến `RailwayNetwork` thành general graph.
+
+**Đã chốt** (không còn là "lưu ý mở" — xem mục 1.4, đã sửa cùng đợt review này): route của một
+`TrainService` KHÔNG suy ra từ một khoảng `Sequence` liên tục trên network toàn cục — `Sequence` chỉ có
+ý nghĩa **cục bộ** trong phạm vi route của chính service đó (lý do: thứ tự dòng thật cho thấy Qui
+Nhơn/Phan Thiết không thể có một vị trí `Sequence` vừa đúng cho tàu bypass — thấy thứ tự `[ảo-Bắc,
+ga-nhánh, ảo/thật-Nam]` — vừa đúng cho tàu terminal — thấy thứ tự `[thật-Nam, ga-nhánh]` — trên MỘT dãy
+tuyến tính tăng/giảm dần duy nhất). Khi code Phase 2.5 thật: xây `RailwayNetwork` **riêng cho từng
+`TrainService`**, còn danh tính Section dùng **chung giữa các tàu** (để `ConflictDetector` so đúng cặp)
+lấy từ `SectionId` suy trực tiếp từ **cặp `StationCode` thật** (vd `"{min(from,to)}-{max(from,to)}"`),
+**tuyệt đối không lẫn `TrainCode` vào `SectionId`** (mục 1.4) — đây là bẫy thực tế đã gặp khi viết tool
+profiling tạm thời (`tools/DataProfiler`, không dùng cho production).
+
+#### 15.13.6 Test bắt buộc (spec + đã code)
+
+| # | Kịch bản | Trạng thái |
+|---|----------|------------|
+| A | Tàu xuyên tuyến: row nhánh `MinRun=0` → hợp lệ, không physical occupation | **Đã code** — `SectionOccupationBuilderTests.BuildForCycle_ZeroDurationHopInMiddle_SkipsOccupationOnlyForThatHop` |
+| B | Tàu kết thúc tại ga nhánh: `MinRun=10` → physical occupation 10 phút | **Đã code** — `SectionOccupationBuilderTests.BuildForCycle_RealBranchTraversal_GeneratesOccupationWithCorrectDuration` |
+| C | Tàu xuất phát tại ga nhánh (chiều ngược): occupation đúng chiều | **Đã code** — `SectionOccupationBuilderTests.BuildForCycle_RealBranchTraversalFromOrigin_GeneratesOccupationInOppositeDirection` |
+| D | `MinRun=0` tại section tuyến chính không cấu hình branch → validation error | **Spec only** — chưa có code vì `TimetableSourceRow`/validator Phase 2.5 chưa implement (mục 15.13.2) |
+| E | Tàu bypass và tàu đi nhánh có raw rows tương tự → `ConflictDetector` không coi cùng chiếm branch section | **Đã code** — `ConflictDetectorTests.BypassTrainAndBranchTerminalTrain_DoNotConflictOnBranchSection` |
+| F | `MinimumJourneyTime` của tàu bypass không cộng thời gian nhánh (và không cộng accel/decel giả quanh đó) | **Đã code** — `MinimumTimetableBuilderTests.Build_ZeroRunningTimeThroughStation_AddsNoAccelerationDecelerationOrStopTime` |
+| G | `ExitTime < EntryTime` (thời lượng âm) → `SectionOccupationBuilder` phải reject/throw, KHÔNG silent-skip (mục 15.13.4) | **Đã code** — `SectionOccupationBuilderTests.BuildForCycle_NegativeDuration_ThrowsInsteadOfSilentlySkipping` |
+
+Toàn bộ 49 test (bao gồm 7 test mới ở trên) đã chạy `dotnet test` — **pass**.
+
+### 15.14 Audit `RailwayNetwork` global vs per-service — phát hiện và sửa 1 lỗi kiến trúc thật
+
+> **Phát hiện sau review lần 3 (2026-08-23):** rà soát `RailwayNetwork.GetStation`,
+> `GetStationSequencesOnRoute`, `MinimumTimetableBuilder`, `SectionOccupationBuilder`, `ConflictDetector`
+> để trả lời đúng câu hỏi "`RailwayNetwork` hiện đang global hay per-service" — kết quả: **có 1 lỗi kiến
+> trúc thật trong code đã commit**, không chỉ là rủi ro lý thuyết.
+
+**Kết quả audit từng lớp:**
+
+- `RailwayNetwork.GetStation`/`GetSectionBetween`/`GetStationSequencesOnRoute`: **trung lập** — chỉ làm
+  việc với `int Sequence` thuần túy, không tự giả định Sequence là "global" hay "per-service". An toàn
+  với cả 2 mô hình.
+- `MinimumTimetableBuilder`: nhận **1** `RailwayNetwork` cho **1** `TrainService` mỗi lần gọi `Build` —
+  đã đúng theo mô hình per-service (mục 1.4) từ đầu, không cần sửa.
+- `SectionOccupationBuilder.BuildForCycle`: nhận **1** `RailwayNetwork` làm tham số cho **1** service mỗi
+  lần gọi — cũng đã đúng per-service, không cần sửa.
+- **`ConflictDetector.Detect` — LỖI THẬT**: chữ ký cũ là
+  `Detect(IReadOnlyList<(TrainService, TrainServiceTrajectory)> services, RailwayNetwork network)` — chỉ
+  **MỘT** `network` dùng chung cho **MỌI** service trong lần gọi. Vòng lặp bên trong gọi
+  `SectionOccupationBuilder.BuildForCycle(service, trajectory, network, cycleIndex)` với **cùng một**
+  `network` cho từng service. Nếu 2 `TrainService` có `StationSequence` cục bộ trùng số nhưng đại diện 2
+  `StationCode` vật lý khác nhau (đúng mô hình mục 1.4), tra `network.GetSectionBetween(10, 11)` cho CẢ
+  HAI sẽ ra **CÙNG MỘT** `Section`/`SectionId` — sai, sẽ tạo conflict giả giữa 2 tài nguyên vật lý không
+  hề liên quan.
+
+**Đã sửa:**
+
+```text
+ConflictDetector.Detect(
+    IReadOnlyList<(TrainService Service, TrainServiceTrajectory Trajectory, RailwayNetwork Network)> services)
+```
+
+Mỗi service mang theo **network của riêng nó** — `ConflictDetector` không còn tham số `network` dùng
+chung nào nữa. `SectionOccupation` (mục 1.6) được bổ sung field `NumberOfTracks` (mang theo từ `Section`
+của network riêng lúc build occupation) để `ConflictDetector` không cần tra lại qua network dùng chung
+cho ngoại lệ double-track (mục 5.3/5.5) — dùng `min(Earlier.NumberOfTracks, Later.NumberOfTracks) >= 2`
+để an toàn nếu 2 network của 2 service lệch nhau (mặc định coi là single-track nếu không đồng thuận).
+
+Danh tính DUY NHẤT `ConflictDetector` dùng để nhóm occupation của nhiều service lại với nhau là
+`SectionOccupation.SectionId` (string) — không bao giờ tự tra `Section` qua một `RailwayNetwork` dùng
+chung. Việc `SectionId` có thực sự phản ánh đúng cùng một `StationCode` vật lý hay không là trách nhiệm
+của **người xây `RailwayNetwork`** (Phase 2.5 mapper, mục 1.4/15.13.5), không phải của
+`ConflictDetector`.
+
+**Test bắt buộc bổ sung (đã code, `ConflictDetectorTests.cs`):**
+
+| Kịch bản | Kết quả mong đợi | Test |
+|----------|-------------------|------|
+| 2 service cùng dùng local `StationSequence` 10→11 (trùng số) nhưng `StationCode` vật lý khác nhau (100→200 vs 300→200) → 2 network riêng gán `SectionId` khác nhau | KHÔNG có conflict nào, dù giờ giấc chồng lấn hoàn toàn | `DifferentTrainsWithCollidingLocalJourneySequence_DoNotShareSectionIdentity` |
+| 2 service dùng local `StationSequence` hoàn toàn khác nhau (5→6 vs 20→21) nhưng cùng một `StationCode` vật lý thật → 2 network riêng gán **cùng** `SectionId` | Vẫn phát hiện đúng conflict tại đúng `SectionId` chung | `DifferentLocalSequenceSchemes_SameSectionId_StillDetectsConflict` |
+
+Cả 2 test đều **pass**, cùng với toàn bộ 51 test hiện có (49 cũ + 2 mới).
