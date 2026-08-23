@@ -722,63 +722,143 @@ sự mô phỏng tiếp; `FutureConflictImpact` chỉ giúp tỉa nhánh sớm v
 
 ---
 
-## 11. Cyclic 24h — chi tiết & điều chỉnh so với đề bài (mục 21 — câu hỏi 15)
+## 11. Cyclic timetable — bài toán tuần hoàn thực sự, không phải lập lịch nhiều ngày (mục 21 — câu hỏi 15)
+**— viết lại toàn bộ theo phản hồi.**
 
-Vì hành trình có thể dài hơn 1440 phút (mục 0), việc chỉ nhân bản Day-1/Day0/Day+1 (cửa sổ −24h→+48h)
-**không đủ** để bắt hết các cặp tàu có thể chồng lấp qua nhiều ngày. Đề xuất tổng quát hoá:
+### 11.1 Phát biểu lại (nhắc lại mục 0.1)
 
-```text
-K := ceil( (MaxJourneyTimeOverAllTrains_minutes) / 1440 ) + 1
-```
-
-Nhân bản mỗi train pattern thành các instance tại offset `k × 1440` với `k ∈ [-K, K]`.
-
-**Tối ưu quan trọng:** vì mọi instance là bản dịch chuyển y hệt của cùng một pattern (do yêu cầu steady-
-state — lịch lặp lại giống hệt mỗi ngày), ta **chỉ cần kiểm tra các cặp trong đó ít nhất một bên là
-instance k=0** (bản canonical). Xung đột giữa `instance(i, k=-1)` và `instance(j, k=1)` là hoàn toàn tương
-đương (sau khi dịch +1440) với xung đột giữa `instance(i, k=0)` và `instance(j, k=2)`, vốn đã được xét khi
-so `k=0` với `k=2`. Điều này giữ độ phức tạp ở mức tuyến tính theo K thay vì bậc hai.
+Đây **không phải** bài toán "lập lịch cho Day-1, Day0, Day+1 rồi lấy Day0 làm kết quả". Đó là một cách
+đọc sai dẫn tới nguy cơ coi mỗi ngày là một bài toán gần-độc-lập. Đúng bản chất: có **một** hàm lịch trình
+canonical duy nhất cho mỗi `TrainService`,
 
 ```text
-ValidateCyclicBoundary():
-    với mỗi train T (k=0) và mỗi train T' bất kỳ (kể cả T'=T), với mọi k ∈ [-K,K]\{0}:
-        so sánh occupation(T, k=0) với occupation(T', k) đã dịch thời gian
-    → dùng CHUNG thuật toán sweep-line ở mục 5, chỉ mở rộng danh sách occupation đưa vào sweep.
+Schedule(Service, Station, n) = Schedule(Service, Station, 0) + n × 1440,   n ∈ ℤ
 ```
 
-Nghiệm cuối cùng công bố = trajectory của các instance `k=0` (đúng theo yêu cầu đề bài); các bản k≠0 chỉ
-tồn tại trong bộ nhớ lúc detect/validate, không xuất ra.
+và mục tiêu là tìm `Schedule(·, ·, 0)` sao cho khi mở rộng tuần hoàn ra **toàn bộ trục thời gian vô hạn**
+(mọi `n ∈ ℤ`, cho mọi service), không có ràng buộc cứng nào — kể cả no-conflict giữa hai `TrainInstance`
+bất kỳ ở hai `CycleIndex` bất kỳ — bị vi phạm. `TrainInstance(Service, n)` chỉ là cách gọi tên cho
+"nghiệm tại offset `n×1440`" — nó không phải một biến quyết định độc lập (mục 0.1).
 
-**Hệ quả thiết kế:** `BeamSearchSolver` giải trên tập instance `k=0` của tất cả train pattern, nhưng
-`ConflictDetector` mà nó gọi phải luôn chạy ở "chế độ cyclic" (tức luôn tính thêm occupation dịch chuyển
-±K×1440 khi kiểm tra 1 section) — không phải một bước validate tách rời chạy sau cùng, mà là một phần
-integral của detection ngay từ Phase 3. `ValidateCyclicBoundary()` ở tầng Validator (Phase 9) là bước
-kiểm tra độc lập, chạy lại từ đầu để xác nhận, không tin tưởng mù quáng rằng solver đã làm đúng.
+### 11.2 Vì sao chỉ cần một cửa sổ hữu hạn `K` để kiểm chứng một điều kiện trên tập vô hạn `n ∈ ℤ`
+
+Đây là phần cần chứng minh chặt, không chỉ "đề xuất":
+
+Với hai `TrainService` bất kỳ `i, j` (cho phép `i = j`), do tính bất biến theo phép dịch của
+`Schedule`, xung đột giữa `Instance(i, n)` và `Instance(j, m)` **chỉ phụ thuộc vào hiệu số**
+`d = m - n`, không phụ thuộc bản thân `n`:
+
+```text
+Conflict(Instance(i,n), Instance(j,m))  ⟺  Conflict(Instance(i,0), Instance(j, m-n))
+```
+
+(vì dịch cả hai instance đi `-n×1440` không đổi việc chúng có chồng lấp thời gian hay không). Do đó, điều
+kiện "không xung đột với mọi `n, m ∈ ℤ`" tương đương "không xung đột với mọi `d ∈ ℤ`, so với instance gốc
+`(i,0)`" — đây là bước rút gọn từ 2 biến tự do (`n, m`) còn 1 biến tự do (`d`), nhưng `d` vẫn chạy trên
+toàn bộ `ℤ`.
+
+**Bước rút gọn thứ hai — chặn `d` bằng hình học của các khoảng chiếm dụng:** `Instance(i,0)` chiếm khoảng
+thời gian tuyệt đối `[dep_i, dep_i + J_i]` (với `dep_i = FixedDepartureTimeOfDay(i) ∈ [0,1440)`,
+`J_i = JourneyTime(i)`); `Instance(j,d)` chiếm `[dep_j + 1440d, dep_j + 1440d + J_j]`. Hai khoảng này
+**chỉ có thể** giao nhau (điều kiện cần, chưa cần đủ, đã là quá đủ để chặn `d`) nếu:
+
+```text
+dep_i < dep_j + 1440d + J_j     và     dep_j + 1440d < dep_i + J_i
+
+⟺  (dep_i - dep_j - J_j) / 1440  <  d  <  (dep_i - dep_j + J_i) / 1440
+```
+
+Vì `dep_i, dep_j ∈ [0, 1440)` nên `dep_i − dep_j ∈ (−1440, 1440)`. Đặt
+`J_max = max(J_i, J_j) ≤ MaxJourneyTimeOverAllServices`, khoảng trên nằm gọn trong:
+
+```text
+d ∈ ( −1 − J_max/1440 ,  1 + J_max/1440 )
+```
+
+Do đó **mọi** `d` có khả năng gây xung đột đều thoả `|d| ≤ K` với:
+
+```text
+K := 1 + ceil( MaxJourneyTimeOverAllServices / 1440 )
+```
+
+— đây là một **cận trên chứng minh được** (không phải ước lượng kinh nghiệm): với `|d| > K`, hai khoảng
+chiếm dụng tuyệt đối không thể giao nhau bất kể `dep_i, dep_j` cụ thể là bao nhiêu, nên chắc chắn không có
+xung đột và không cần kiểm tra. Có thể cộng thêm `SafetyMargin` (config, mặc định 0) cho các trường hợp
+biên do làm tròn/độ trễ headway cộng thêm ở sát mép khoảng.
+
+**Kết luận:** kiểm tra toàn bộ cặp `(i, j, d)` với `d ∈ [-K, K]` (bao gồm `i = j`, loại trừ đúng
+`(i=j, d=0)` là tự-so-sánh vô nghĩa) — dùng instance `(i, 0)` làm "đầu dò" cố định, so với `(j, d)` — là
+**đủ và cần thiết** để đảm bảo tuần hoàn vô hạn hợp lệ. Đây khớp với đề xuất ban đầu
+(`K = ceil(MaxJourneyTime/1440) + 1`) nhưng nay có chứng minh, và quan trọng hơn: khẳng định **so
+với `i=j` (một service tự xung đột với chính bản sao ngày sau/ngày trước của nó)** cũng nằm trong phạm vi
+phải kiểm tra — đây chính là trường hợp `Test 11 (mục 13)`: khi `J_i > 1440`, chuyến hôm sau của cùng một
+service có thể vẫn "đang chạy" trong khi chuyến hôm nay chưa kết thúc → là một xung đột `HEADWAY` cùng
+chiều thật sự (hai đoàn tàu vật lý khác nhau của cùng một service, chạy nối đuôi cách nhau đúng 1440
+phút ở điểm xuất phát).
+
+### 11.3 Thuật toán detection & validate
+
+```text
+ConflictDetector.Detect(services):
+    occupations := []
+    for service in services:
+        for n in [-K, K]:                       // K tính theo mục 11.2, một lần cho toàn hệ thống
+            occupations += SectionOccupation.From(service.Trajectory, cycleIndex = n)
+    → chạy sweep-line (mục 5) như bình thường trên TOÀN BỘ occupations này
+    → nhưng chỉ giữ lại Conflict mà ÍT NHẤT MỘT bên có CycleIndex == 0
+      (theo lập luận 11.2: các cặp còn lại (CycleIndex đều ≠ 0) là suy ra được/trùng lặp với
+       một cặp đã có CycleIndex 0, không cần xử lý — chỉ cần khi RESOLVE, ghi decision vào
+       TrainService phía có mặt trong cặp, bất kể cặp đó lấy "đầu dò" là bên nào)
+```
+
+Vì đây là cách `ConflictDetector` hoạt động **mặc định** (không phải một chế độ đặc biệt bật lên sau), nó
+áp dụng xuyên suốt từ Phase 3 (detection thuần) tới Phase 7 (trong vòng lặp beam search, mục 9.2) — không
+có khái niệm "phát hiện trong ngày" tách biệt với "phát hiện xuyên biên chu kỳ".
+
+```text
+ValidateCyclicBoundary()  (Phase 9, TimetableValidator — độc lập với solver):
+    Chạy lại đúng thuật toán Detect ở trên từ đầu trên nghiệm cuối cùng (Schedule(·,·,0) đã solver chốt),
+    với K tính lại (không tin cache của solver), xác nhận danh sách Conflict trả về RỖNG.
+    Council thêm: kiểm tra riêng các occupation có ExitTime hoặc EntryTime rơi vào [-margin, margin] và
+    [1440-margin, 1440+margin] (sát mép chu kỳ) để dễ debug khi có vi phạm — dù về logic, thuật toán trên
+    đã bao trùm toàn bộ trục, không chỉ vùng sát mép.
+```
+
+Nghiệm cuối cùng công bố = `Schedule(·,·,0)` của mọi `TrainService` (đúng theo yêu cầu đề bài); các
+instance `n≠0` không bao giờ được lưu, chỉ tồn tại tạm thời trong bộ nhớ lúc detect/validate.
 
 ---
 
 ## 12. Các nguyên nhân có thể khiến toàn bộ timetable infeasible (câu hỏi 16)
 
-1. `TotalBuffer(T) < 0` cho ít nhất 1 tàu — bản thân giờ đi/đến cố định đã không tự nhất quán với
-   `MinimumJourneyTime` (chưa cần xét tàu khác).
+1. `TotalBuffer(T) < 0` cho ít nhất 1 `TrainService` — bản thân giờ đi/đến cố định đã không tự nhất quán
+   với `MinimumJourneyTime` (chưa cần xét service khác).
 2. Tại một xung đột, **không candidate station nào trong cửa sổ** thoả `CanMeet`/`CanOvertake` — cần mở
    rộng `CandidateWindow` (cấu hình) hoặc đây là giới hạn hạ tầng thật (khu gian quá dài không có ga tránh).
-3. Với mọi candidate khả dĩ, `RequiredShift > UsableSlack` của cả hai tàu — không đủ quỹ thời gian để giải
-   dù ở bất kỳ ga nào trong cửa sổ.
+3. Với mọi candidate khả dĩ, `RequiredShift > ForwardSlack` (mục 4.1) của cả hai service — không đủ quỹ
+   thời gian cục bộ để giải dù ở bất kỳ ga nào trong cửa sổ (kể cả sau khi Phase 8 thử mượn
+   `RedistributableSlack` theo mục 4.2 mà vẫn không đủ, hoặc việc mượn bị chặn vì re-validate upstream
+   thất bại).
 4. **Hiệu ứng dây chuyền**: giải xung đột A tiêu hết slack cần cho xung đột B ngay sau đó, và không nhánh
    beam search nào (trong `BeamWidth` × `LookAheadConflicts` đã thử) sống sót — biểu hiện bằng
    `frontier` rỗng sau một tầng.
 5. **Giới hạn năng lực ga**: nhiều hơn `MaxSimultaneousTrains` của một ga cần đỗ/tránh cùng lúc tại cùng
-   thời điểm (ví dụ 3 tàu cùng cần gặp nhau ở ga chỉ có 2 track).
-6. **Vi phạm biên chu kỳ không thể sửa**: sau khi mở rộng theo mục 11, phát hiện một tàu tự xung đột với
-   chính bản sao dịch 24h/48h/... của các tàu khác mà không còn slack để điều chỉnh (vì giờ đi/đến gốc là
-   bất biến mỗi ngày).
-7. Mâu thuẫn ưu tiên/priority tuyệt đối kết hợp ràng buộc cứng khác (ví dụ 2 tàu cùng "không được dừng ở
-   bất kỳ đâu ngoài ga đã khai báo" và không có ga hợp lệ nào trong vùng giao nhau).
+   thời điểm (ví dụ 3 service cùng cần gặp nhau ở ga chỉ có 2 track).
+6. **Một `TrainService` tự xung đột với chính nó qua chu kỳ** (`i = j`, `d ≠ 0` ở mục 11.2): khi
+   `JourneyTime(T) > 1440` và không đủ slack để tạo giãn cách `SameDirectionHeadway` giữa chuyến hôm nay
+   và chuyến hôm sau/hôm trước của cùng service tại điểm chúng còn gần nhau trên tuyến — đây là nguyên
+   nhân **mới so với bản Phase 1 đầu tiên**, chỉ xuất hiện khi mô hình hoá đúng theo `TrainService`/
+   `TrainInstance` (mục 0.1, 11.2) thay vì coi các ngày độc lập.
+7. **Vi phạm chu kỳ giữa hai service khác nhau không thể sửa**: sau khi quét đủ `K` theo mục 11.2, phát
+   hiện một cặp `(Service_i, Service_j, d)` xung đột mà không còn `ForwardSlack` (và cả
+   `RedistributableSlack` đã re-validate) để điều chỉnh, vì `FixedDepartureTimeOfDay` mỗi service là bất
+   biến qua mọi chu kỳ.
+8. Mâu thuẫn ưu tiên/priority tuyệt đối kết hợp ràng buộc cứng khác (ví dụ 2 service cùng "không được dừng
+   ở bất kỳ đâu ngoài ga đã khai báo" và không có ga hợp lệ nào trong vùng giao nhau).
 
 `TimetableValidator` (Phase 9, độc lập với solver — mục 24) phải phát hiện và **định vị chính xác** loại
-nào trong 7 loại trên đang xảy ra, trả về `{Train, Station/Section, Constraint, Expected, Actual}` thay vì
-chỉ báo "infeasible".
+nào trong 8 loại trên đang xảy ra, trả về `{Service, Station/Section, Constraint, Expected, Actual}` thay
+vì chỉ báo "infeasible".
 
 ---
 
@@ -794,7 +874,7 @@ nghiệm thu cho từng Phase:
 | 3 | Tàu vốn dừng tại ga tránh vs. tàu phải ForcedStop | RequiredShiftCalculator — ưu tiên ga tàu đã dừng sẵn khi điều kiện khác tương đương | 5 |
 | 4 | 2 xung đột liên tiếp | Chứng minh pure-greedy cho nghiệm xấu; Beam Search cho nghiệm tốt hơn | 7 |
 | 5 | Tàu nhanh đuổi tàu chậm | OvertakeResolver + phát hiện OVERTAKE | 3, 6 |
-| 6 | Xung đột qua biên 23:xx Day0 / 00:xx Day+1 | ConflictDetector chế độ cyclic (mục 11) | 3, 9 |
+| 6 | Xung đột qua biên 23:xx / 00:xx giữa 2 service khác nhau | ConflictDetector xét đúng cặp `(i,j,d=1)` theo mục 11.2 | 3, 9 |
 | 7 | Tàu không đủ TotalBuffer | BufferCalculator báo infeasible ngay từ đầu, không đưa vào solver | 2 |
 | 8 | Technical stop 20 phút | MinimumTimetableBuilder + StopRules | 2 |
 | 9 | Passenger stop 3 phút | MinimumTimetableBuilder + StopRules | 2 |
@@ -804,27 +884,46 @@ Bổ sung thêm (phát sinh từ phân tích ở trên, nên có thêm trước 
 
 | # | Kịch bản | Lý do thêm |
 |---|----------|------------|
-| 11 | Hành trình dài hơn 24h (vd 30h) với 2 tàu chạy hàng ngày | Kiểm chứng đúng mục 0 & 11 — cửa sổ nhân bản K>1, không chỉ Day±1 |
+| 11 | Hành trình dài hơn 24h (vd 30h) với 1 service chạy hàng ngày | Kiểm chứng `K > 1` (mục 11.2) VÀ tự động phát hiện self-conflict `(i=j, d=1)` giữa chuyến hôm nay và hôm sau nếu không đủ headway |
 | 12 | Ga chỉ có `CanMeet=true` nhưng `CanOvertake=false` | CandidateGenerator lọc đúng theo `Conflict.Type` |
-| 13 | 3 tàu cùng cần gặp nhau tại 1 ga chỉ có 2 track | Phát hiện đúng nguyên nhân infeasible #5 (mục 12) |
-| 14 | Reallocate buffer sau khi có nghiệm khả thi (Phase 8) | BufferAllocator cải thiện phân bố recovery mà không phá vỡ nghiệm đã đúng |
+| 13 | 3 service cùng cần gặp nhau tại 1 ga chỉ có 2 track | Phát hiện đúng nguyên nhân infeasible #5 (mục 12) |
+| 14 | Reallocate buffer sau khi có nghiệm khả thi (Phase 8) | `SlackReallocationStrategy` (mục 4.2) cải thiện phân bố recovery, có re-validate, không phá vỡ nghiệm đã đúng |
+| 15 | Resolve 1 conflict giữa `Instance(A,0)` và `Instance(B,1)` | Quyết định phải ghi vào `TrainService B` (chu kỳ 0) — sau khi apply, `Instance(B,0)` và `Instance(B,1)` đều dịch đúng cùng lượng, không được sửa lệch nhau (mục 0.1 hệ quả 2) |
+| 16 | Resolve xong 1 conflict làm dịch `TrainService W`, việc dịch chuyển đó lại tạo xung đột mới giữa `Instance(W, d+1)` (trước đó vô hại) và 1 service thứ 3 | `RecalculateAffected` phải quét lại TOÀN BỘ `CycleIndex ∈ [-K,K]` của `W`, không chỉ cặp instance ban đầu (mục 0.1 hệ quả 3, mục 9.2) |
 
 ---
 
-## 14. Câu hỏi cần Product/User quyết định trước khi vào Phase 2
+## 14. Quyết định kỹ thuật đã chốt & câu hỏi còn mở trước khi vào Phase 2
 
-Đây là các quyết định **không thể suy ra từ bài toán**, cần xác nhận để tránh phải sửa domain model giữa
-chừng:
+### 14.1 Đã chốt
 
-1. **Ngôn ngữ/stack triển khai** — style định danh (`TrainId`, `PascalCase`) gợi ý C#/.NET, nhưng chưa có
-   xác nhận. Cần biết để Phase 2 bắt đầu viết code thật.
-2. **Nguồn dữ liệu 178 ga & khu gian** — đã có sẵn (CSV/DB/API) hay cần nhập tay/mock cho Phase 2–7 rồi
-   nạp dữ liệu thật sau?
-3. **Dữ liệu năng lực tránh/vượt từng ga** (`StationTrack`) — đã có, hay tạm thời giả định `CanMeet=true`
+- **Ngôn ngữ/stack: C# / .NET 8 (LTS)**, unit test bằng **xUnit**.
+- `Domain` và `Engine` (namespace theo mục "kiến trúc code" của đặc tả gốc) **độc lập với UI/database** —
+  không phụ thuộc EF Core, ASP.NET, hay bất kỳ package hạ tầng nào; chỉ POCO/record + interface.
+- Phase 2 dùng **in-memory data** (danh sách `Station`/`Section`/`TrainService` khởi tạo trực tiếp trong
+  code hoặc test fixture); chưa tích hợp SQL Server — việc đọc dữ liệu từ DB thật là một
+  `IRepository`/mapping layer làm sau, không ảnh hưởng `Domain`/`Engine`.
+- Toàn bộ hằng số nghiệp vụ (`PassengerStop`, `TechnicalStop`, `AccelerationPenalty`,
+  `DecelerationPenalty`, `MeetHeadway`, `OvertakeHeadway`, `SameDirectionHeadway`, `CandidateWindow`,
+  `BeamWidth`, `LookAheadConflicts`, các trọng số cost `α..ε`) nằm trong `Configuration`, truyền vào
+  `Engine` qua interface (`IStopRules`, `IRunningTimeRules`, `IHeadwayRules`, `SolverParameters`,
+  `CostWeights`) — không hard-code ở bất kỳ đâu trong `Engine`.
+- Có thể dùng **immutable record** cho `Domain` (Station, Section, TrainService, TimetableEntry...) và mô
+  hình **persistent/delta state** (mục 9.1) cho `SearchState` của beam search — implement bằng C# `record`
+  (value equality + `with`-expression cho copy-on-write nhẹ) kết hợp con trỏ `ParentState` để giữ tính
+  chất O(1)-theo-số-tàu-bị-ảnh-hưởng đã phân tích ở mục 9.1.
+
+### 14.2 Còn mở — cần xác nhận trước khi viết code Phase 2
+
+1. **Nguồn dữ liệu 178 ga & khu gian** — đã có sẵn (CSV/DB/API) hay cần mock cho Phase 2–7 rồi nạp dữ
+   liệu thật sau?
+2. **Dữ liệu năng lực tránh/vượt từng ga** (`StationTrack`) — đã có, hay tạm thời giả định `CanMeet=true`
    cho tất cả ga và bổ sung sau?
-4. **`SameDirectionHeadway` mặc định** — đề bài chỉ cho `MeetHeadway=3` và ngụ ý `OvertakeHeadway`,
-   nhưng chưa có giá trị mặc định cho giãn cách cùng chiều thuần tuý (không overtake). Cần một con số khởi
-   điểm (có thể tạm dùng chung giá trị với MeetHeadway, nhưng nên xác nhận).
+3. **`SameDirectionHeadway` mặc định** — đề bài chỉ cho `MeetHeadway=3` và ngụ ý `OvertakeHeadway`, nhưng
+   chưa có giá trị mặc định cho giãn cách cùng chiều thuần tuý (không overtake). Cần một con số khởi điểm
+   (có thể tạm dùng chung giá trị với `MeetHeadway`, nhưng nên xác nhận).
 
-Tôi đề xuất: mock dữ liệu ga/khu gian tối thiểu cho Phase 2–7 (đủ để chạy 14 unit test ở mục 13), và chỉ
-cần chốt ngôn ngữ lập trình để bắt đầu code Phase 2.
+Đề xuất: mock dữ liệu ga/khu gian tối thiểu cho Phase 2–7 (đủ để chạy 16 unit test ở mục 13), tạm đặt
+`SameDirectionHeadway = MeetHeadway` làm giá trị khởi điểm có thể đổi qua config, và bắt đầu code Phase 2
+(solution `.sln` + project `Domain`, `Engine`, `Configuration`, và `*.Tests` bằng xUnit) ngay khi được xác
+nhận.
