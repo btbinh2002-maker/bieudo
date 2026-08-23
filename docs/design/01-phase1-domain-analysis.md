@@ -245,7 +245,12 @@ TimetableEntry
   AccelerationApplied: bool
   DecelerationApplied: bool
   RecoveryTimeFromPrev: int     // buffer/recovery cấy vào khu gian trước ga này
-  AccumulatedBufferUsed: int    // tổng buffer đã tiêu tới ga này (từ đầu hành trình)
+  CumulativeInsertedDelayMinutes: int
+                                 // tổng số phút delay đã TỪNG được chèn (InsertDelay) tính dồn tới ga
+                                 // này - KHÔNG phải lượng buffer/recovery thực tế đã tiêu (phần đó có
+                                 // thể đã được RecoveryTimeFromPrev hấp thụ). Dùng để audit "đã có bao
+                                 // nhiêu quyết định delay áp lên tàu này"; muốn biết buffer còn lại thì
+                                 // dùng ForwardSlack(T,k) (mục 4.1), không suy diễn từ trường này.
 ```
 
 `TrainServiceTrajectory = List<TimetableEntry>` theo đúng thứ tự ga trên route, thuộc về `TrainService`
@@ -382,7 +387,11 @@ tàu còn 40 phút buffer nhưng 35 phút nằm sau xung đột hiện tại →
 
 Vì tính an toàn (không phụ thuộc giả định về việc tái phân bổ ngược), **`RequiredShiftCalculator` mặc
 định chỉ được phép tiêu tới `ForwardSlack(T,k)`** cho một xung đột tại k — đây là con số dùng trong mọi
-kiểm tra feasibility ở mục 7, 8.
+kiểm tra feasibility ở mục 7, 8. Mô hình hiện tại **không có ràng buộc giờ đến/đi cố định tại các ga
+trung gian** (chỉ có ở ga xuất phát và ga cuối — mục "Dữ liệu của tàu khách"), nên `ForwardSlack(T,k)` là
+đúng nghĩa **hard upper bound** cho tổng delay có thể chèn tại k mà không cần xét thêm ràng buộc trung
+gian nào khác; nếu sau này có thêm giờ cố định tại một ga trung gian (vd. ga kết nối liên vận), công thức
+phải thu hẹp lại theo mốc cố định gần nhất phía sau k thay vì `FixedArrivalTime` tại đích.
 
 ### 4.2 RedistributableSlack(T, k) — buffer đã cấy Ở PHÍA TRƯỚC k, có thể "mượn" nhưng phải re-validate
 
@@ -505,20 +514,90 @@ vào service).
 
 ## 7. RequiredShiftCalculator (mục 12 — câu hỏi 9)
 
-Đây là hàm nghiệp vụ trung tâm, tách bạch theo `Conflict.Type`:
+Đây là hàm nghiệp vụ trung tâm, tách bạch theo `Conflict.Type`.
+
+### 7.0 Quyết định kiến trúc (sau review Phase 2): KHÔNG gộp Accel/Decel/Waiting thành một scalar
+
+`ForcedStop` sinh ra **hai loại thay đổi khác nhau về bản chất vật lý** trên trajectory, xảy ra ở
+**hai vị trí khác nhau**, và **không được cộng gộp thành một con số `delayMinutes` duy nhất rồi chèn
+tại một điểm** (rủi ro cụ thể: Arrival(S) bị cộng nhầm cả AccelerationPenalty dù gia tốc chỉ xảy ra ở
+khu gian S→S+1 *sau* ga S; RunningTimeFromPrev(S) và RunningTimeFromPrev(S+1) không phản ánh đúng vị
+trí penalty; section occupation dùng cho `ConflictDetector` (mục 1.6) vì vậy sai theo):
+
+```text
+Section S-1 → S      Ga S            Section S → S+1
+      +1'            (dừng)               +2'
+  DecelerationPenalty              AccelerationPenalty
+```
+
+1. **Structural stop mutation** — hệ quả *vật lý* của việc chuyển S từ Through sang có dừng, không phụ
+   thuộc headway với tàu kia, cố định vị trí trên trajectory:
+
+   ```text
+   ApplyForcedStop(T, S):
+       StopType(S)                := ForcedMeet | ForcedOvertake
+       RunningTimeFromPrev(S)     += DecelerationPenalty     // khu gian (S-1 → S)
+       RunningTimeFromPrev(S+1)   += AccelerationPenalty     // khu gian (S → S+1)
+       // Arrival(S) tăng đúng DecelerationPenalty; từ S+1 trở đi, phần dôi ra
+       // (DecelerationPenalty + AccelerationPenalty) lan truyền xuôi dòng bằng
+       // ĐÚNG cơ chế propagation ở mục 8 (hấp thụ dần vào RecoveryTimeFromPrev phía sau),
+       // neo carry bắt đầu từ S+1 — KHÔNG neo tại S, vì DecelerationPenalty đã "tiêu" cục bộ
+       // ngay trong RunningTimeFromPrev(S) chứ chưa cần propagate.
+   ```
+
+2. **Operational waiting mutation** — hệ quả từ ràng buộc headway với tàu kia, chèn đúng tại ga S,
+   dùng **nguyên trạng** `TrajectoryPropagator.InsertDelay` (mục 8) trên trajectory ĐÃ được
+   `ApplyForcedStop` cập nhật (vì `NaturalDeparture(W,S)` ở dưới phải đọc `Arrival(S)` sau khi đã cộng
+   `DecelerationPenalty`, nếu không `ExtraWait` sẽ bị tính thiếu):
+
+   ```text
+   RequiredWaitingMinutes := ExtraWait(W, S)      // công thức 7.1/7.2 bên dưới
+   InsertDelayAtStation(T, S, RequiredWaitingMinutes)
+   ```
+
+`TrajectoryPropagator` (Phase 2, đã chốt) giữ nguyên: nó **không** tự suy luận ForcedStop/MEET/OVERTAKE,
+chỉ nhận một con số và một điểm neo rồi lan truyền thuần tuý. Cả hai bước trên đều là **caller** của
+cùng một primitive propagation, khác nhau ở: (a) trajectory đầu vào (trước/sau `ApplyForcedStop`), (b)
+điểm neo carry (S+1 cho structural, S cho operational).
+
+**Thứ tự bắt buộc**: `ApplyForcedStop` phải chạy **trước** khi tính `NaturalDeparture`/`ExtraWait`, và cả
+hai mutation phải được coi là **atomic đối với một candidate** — `RequiredShiftCalculator` chỉ *tính*
+(không mutate trajectory thật), trả về đủ dữ liệu để một `CandidateApplicator`/`TrajectoryMutator` ở tầng
+gọi (Phase 6/7) áp dụng cả hai theo đúng thứ tự MỘT LẦN khi candidate được chọn — tránh double-apply nếu
+candidate bị đánh giá nhiều lần trong beam search mà không được chọn.
+
+```text
+RequiredShiftResult
+{
+    IsFeasible: bool
+    IsForcedStop: bool                 // = ForcedStop(W,S)
+    DecelerationPenaltyMinutes: int    // 0 nếu !IsForcedStop
+    AccelerationPenaltyMinutes: int    // 0 nếu !IsForcedStop
+    RequiredWaitingMinutes: int        // = ExtraWait(W,S), tính SAU khi áp structural (nếu có)
+    TotalAdditionalTimeMinutes: int    // = Decel + Accel + RequiredWaiting — dùng cho điều kiện 6, mục 7.3
+    ViolatedConstraint: string?
+}
+```
+
+(Thay cho `ShiftResult { IsFeasible, ShiftMinutes, ForcedStop, ViolatedConstraint? }` ở bản nháp trước —
+`ShiftMinutes` đơn lẻ không đủ để `CandidateApplicator` biết áp penalty ở đâu.)
 
 ### 7.1 MEET tại ga S, tàu chờ = W, tàu đi qua = P
 
 ```text
 ForcedStop(W, S) = (S không thuộc StopRequirements của W)   // true nếu W vốn chạy thông qua S
 
+// Bước 1 (nếu ForcedStop): ApplyForcedStop(T, S) — xem mục 7.0 — rồi mới đọc Arrival(W,S) bên dưới.
+
 EarliestSafeDeparture(W, S) = Arrival(P, S) + MeetHeadway     // theo đúng công thức mục 6 đề bài
-NaturalDeparture(W, S)      = Arrival(W,S,tự nhiên) + StopTime(W,S,tự nhiên hoặc 0 nếu qua thông)
+NaturalDeparture(W, S)      = Arrival(W,S, SAU structural nếu có) + StopTime(W,S,tự nhiên hoặc 0 nếu qua thông)
 
 ExtraWait(W, S) = MAX(0, EarliestSafeDeparture(W,S) - NaturalDeparture(W,S))
 
-RequiredShift(W) =
-    ExtraWait(W,S)
+RequiredWaitingMinutes(W) = ExtraWait(W, S)   // bước 2 (operational) — xem mục 7.0
+
+TotalAdditionalTimeMinutes(W) =
+    RequiredWaitingMinutes(W)
   + [ ForcedStop(W,S) ?  AccelerationPenalty + DecelerationPenalty  : 0 ]
 ```
 
@@ -532,9 +611,10 @@ chỉ đổi biến nào là "đến trước/đi sau". `RequiredShiftCalculator
 
 ```text
 NaturalDeparture(Fast, S) = ... (không đổi, Fast không bị ảnh hưởng nếu S có đủ track vượt)
+// Bước 1 (nếu ForcedStop(Slow,S)): ApplyForcedStop(T, S) trước, rồi mới đọc NaturalDeparture(Slow,S).
 EarliestSafeDeparture(Slow, S) = Departure(Fast, S) + OvertakeHeadway
-ExtraWait(Slow, S) = MAX(0, EarliestSafeDeparture(Slow,S) - NaturalDeparture(Slow,S))
-RequiredShift(Slow) = ExtraWait(Slow,S) + [ForcedStop(Slow,S) ? Accel+Decel : 0]
+RequiredWaitingMinutes(Slow) = MAX(0, EarliestSafeDeparture(Slow,S) - NaturalDeparture(Slow,S))
+TotalAdditionalTimeMinutes(Slow) = RequiredWaitingMinutes(Slow) + [ForcedStop(Slow,S) ? Accel+Decel : 0]
 ```
 
 Điều kiện tiên quyết: `Arrival(Fast, S) < Departure(Slow, S) tự nhiên` (Fast phải đến kịp trước khi Slow
@@ -548,10 +628,19 @@ RequiredShift(Slow) = ExtraWait(Slow,S) + [ForcedStop(Slow,S) ? Accel+Decel : 0]
 4.   Accel/Decel cộng đúng nếu ForcedStop=true                              → đã tính ở trên.
 5.   FixedDepartureTime tại ga xuất phát KHÔNG đổi                          → shift chỉ áp dụng từ ga hiện
                                                                                 tại trở đi, không lùi về gốc.
-6.   RequiredShift(W) <= ForwardSlack(W, S)  (mục 4.1)                       → nếu vượt, candidate infeasible
-                                                                                theo mặc định (Phase 5-7);
-                                                                                chỉ Phase 8 mới thử mượn thêm
-                                                                                RedistributableSlack (mục 4.2).
+6.   TotalAdditionalTimeMinutes(W) <= ForwardSlack(W, S)  (mục 4.1)          → nếu vượt, candidate
+                                                                                infeasible theo mặc định
+                                                                                (Phase 5-7); chỉ Phase 8
+                                                                                mới thử mượn thêm
+                                                                                RedistributableSlack (mục
+                                                                                4.2). Lưu ý: so sánh dùng
+                                                                                TỔNG (Decel+Accel+Waiting,
+                                                                                mục 7.0), không chỉ phần
+                                                                                waiting — nếu chỉ so
+                                                                                waiting thì structural
+                                                                                mutation có thể tự nó đã
+                                                                                đẩy tàu trễ FixedArrivalTime
+                                                                                mà không bị chặn.
 7.   Không tạo xung đột "không thể giải" phía sau                          → KHÔNG do hàm này tự đảm bảo,
                                                                                 mà do bước Rolling-Horizon
                                                                                 re-check (mục 9, 14) làm sau
@@ -565,28 +654,34 @@ RequiredShift(Slow) = ExtraWait(Slow,S) + [ForcedStop(Slow,S) ? Accel+Decel : 0]
                                                                                 (xem mục 9.2).
 ```
 
-`RequiredShiftCalculator` trả về `ShiftResult { IsFeasible, ShiftMinutes, ForcedStop, ViolatedConstraint? }`
-— không tự quyết định chọn, chỉ tính toán chính xác cho `CandidateEvaluator` dùng.
+`RequiredShiftCalculator` trả về `RequiredShiftResult` (mục 7.0) — không tự quyết định chọn, cũng
+**không tự mutate trajectory**, chỉ tính toán chính xác cho `CandidateEvaluator` dùng; việc mutate là
+trách nhiệm của `CandidateApplicator`/`TrajectoryMutator` (mục 7.0) khi candidate được chọn.
 
-**Vì sao điều kiện 6 (`RequiredShift <= ForwardSlack`) đủ để đảm bảo điều kiện 5 và tính hấp thụ được ở
-mục 8:** theo định nghĩa `ForwardSlack(T,k) = FixedArrivalTime(T) - CurrentDeparture(T,k) -
+**Vì sao điều kiện 6 (`TotalAdditionalTimeMinutes <= ForwardSlack`) đủ để đảm bảo điều kiện 5 và tính hấp
+thụ được ở mục 8:** theo định nghĩa `ForwardSlack(T,k) = FixedArrivalTime(T) - CurrentDeparture(T,k) -
 MinimumRemainingJourneyTime(T,k→dest)`, nếu `delta <= ForwardSlack(T,k)` thì kể cả trong tình huống xấu
 nhất — bỏ hết mọi recovery-time đã hoạch định ở các ga sau `k` và chạy đúng bằng tối thiểu suốt phần còn
-lại — tàu vẫn đến đích không muộn hơn `FixedArrivalTime(T)`. Đây chính là lý do thuật toán propagation ở
-mục 8 luôn tìm được cách hấp thụ hết `delta` mà **không cần biết trước** buffer downstream được phân bố cụ
-thể ra sao — nó chỉ cần tồn tại (dưới dạng recovery đã cấy, hoặc dưới dạng "chưa cấy nhưng vẫn nằm trong
-biên `MinimumJourneyTime`") đủ nhiều theo đúng số học ở trên.
+lại — tàu vẫn đến đích không muộn hơn `FixedArrivalTime(T)`. Điều này đúng bất kể `delta` đó là một
+`RequiredWaitingMinutes` chèn tại `S` hay là `DecelerationPenalty+AccelerationPenalty` chèn (thực chất)
+từ `S+1` — vì `ForwardSlack` không quan tâm delta "được neo ở đâu trong khoảng [k, S]", chỉ quan tâm
+tổng cộng dồn từ `k` trở đi có vượt quá phần đệm còn lại hay không. Đây chính là lý do thuật toán
+propagation ở mục 8 luôn tìm được cách hấp thụ hết `delta` mà **không cần biết trước** buffer downstream
+được phân bố cụ thể ra sao — nó chỉ cần tồn tại (dưới dạng recovery đã cấy, hoặc dưới dạng "chưa cấy
+nhưng vẫn nằm trong biên `MinimumJourneyTime`") đủ nhiều theo đúng số học ở trên.
 
 ---
 
 ## 8. Propagation dọc trajectory (mục 19 — câu hỏi 12)
 
-Sau khi xác định `RequiredShift(W)` tại ga `S`, lan truyền như sau (đi từ `S` về phía đích của `W`):
+`TrajectoryPropagator.InsertDelay(T, k, delta)` (Phase 2, đã implement — xem
+`src/TrainTimetable.Engine/TrajectoryPropagator.cs`) là **primitive duy nhất** thực hiện lan truyền dưới
+đây; nó nhận một điểm neo `k` và một `delta` thuần túy, không biết `delta` đến từ đâu:
 
 ```text
-delta := RequiredShift
-for station m from S to Destination(W):
-    Departure(m) += delta          // (nếu m == S: set theo EarliestSafeDeparture; nếu m > S: cộng dồn)
+delta := input
+for station m from k to Destination(T):
+    Departure(m) += delta          // (nếu m == k: set theo giá trị mới; nếu m > k: cộng dồn)
     plannedRecovery = RecoveryTimeFromPrev(m+1)
     if plannedRecovery >= delta:
         RecoveryTimeFromPrev(m+1) -= delta
@@ -599,9 +694,28 @@ for station m from S to Destination(W):
 continue cho tới khi delta == 0 hoặc chạm Destination
 ```
 
-Vì `RequiredShift` đã được kiểm tra `<= UsableSlack` trước khi commit, về mặt lý thuyết `delta` sẽ luôn
-được hấp thụ hết trước khi chạm `FixedArrivalTime` — invariant này chính là điều `RequiredShiftCalculator`
-phải đảm bảo (mục 7.3, điều kiện 6).
+Theo kiến trúc mục 7.0, một `ForcedStop` tại ga `S` gọi primitive này **hai lần**, với hai điểm neo khác
+nhau, theo đúng thứ tự:
+
+```text
+1. ApplyForcedStop(T, S):
+     RunningTimeFromPrev(S)   += DecelerationPenalty
+     RunningTimeFromPrev(S+1) += AccelerationPenalty
+     InsertDelay(T, k=S+1, delta=DecelerationPenalty+AccelerationPenalty)   // neo tại S+1, xem mục 7.0
+2. InsertDelay(T, k=S, delta=RequiredWaitingMinutes)                        // neo tại S
+```
+
+(Nếu conflict không phải MEET/OVERTAKE mà chỉ là delay vận hành thuần túy — vd tàu trễ do sự cố — thì
+chỉ có bước 2 chạy, với `S` = ga phát sinh delay; đây chính là use case gốc mà `TrajectoryPropagatorTests`
+đang kiểm chứng ở Phase 2.)
+
+Vì `TotalAdditionalTimeMinutes` đã được kiểm tra `<= ForwardSlack` (mục 7.3, điều kiện 6) trước khi commit
+— tính trên **tổng** cả hai lần gọi — về mặt lý thuyết `delta` ở cả hai bước cộng lại sẽ luôn được hấp thụ
+hết trước khi chạm `FixedArrivalTime`, cho dù bước 1 (neo tại S+1) tiêu một phần recovery trước khi bước 2
+(neo tại S) chạy tới. Invariant này chính là điều `RequiredShiftCalculator` phải đảm bảo (mục 7.3, điều
+kiện 6), và Phase 2 `TrajectoryPropagator` tự nó **không cần biết** có đang xử lý ForcedStop hay không —
+đúng như đã chốt trong review Phase 2 (`TrajectoryPropagator` giữ đơn giản, không tự suy luận nghiệp vụ
+tránh/vượt).
 
 **Early-exit** khi `delta == 0` là mấu chốt cho yêu cầu hiệu năng ở mục 29: trong đa số trường hợp buffer
 được rải hợp lý, propagation chỉ chạm vài ga chứ không phải toàn bộ phần còn lại của route.
@@ -786,15 +900,43 @@ chiếm dụng tuyệt đối không thể giao nhau bất kể `dep_i, dep_j` c
 xung đột và không cần kiểm tra. Có thể cộng thêm `SafetyMargin` (config, mặc định 0) cho các trường hợp
 biên do làm tròn/độ trễ headway cộng thêm ở sát mép khoảng.
 
-**Kết luận:** kiểm tra toàn bộ cặp `(i, j, d)` với `d ∈ [-K, K]` (bao gồm `i = j`, loại trừ đúng
-`(i=j, d=0)` là tự-so-sánh vô nghĩa) — dùng instance `(i, 0)` làm "đầu dò" cố định, so với `(j, d)` — là
-**đủ và cần thiết** để đảm bảo tuần hoàn vô hạn hợp lệ. Đây khớp với đề xuất ban đầu
-(`K = ceil(MaxJourneyTime/1440) + 1`) nhưng nay có chứng minh, và quan trọng hơn: khẳng định **so
-với `i=j` (một service tự xung đột với chính bản sao ngày sau/ngày trước của nó)** cũng nằm trong phạm vi
-phải kiểm tra — đây chính là trường hợp `Test 11 (mục 13)`: khi `J_i > 1440`, chuyến hôm sau của cùng một
-service có thể vẫn "đang chạy" trong khi chuyến hôm nay chưa kết thúc → là một xung đột `HEADWAY` cùng
-chiều thật sự (hai đoàn tàu vật lý khác nhau của cùng một service, chạy nối đuôi cách nhau đúng 1440
-phút ở điểm xuất phát).
+**Kết luận (phần `i ≠ j`):** kiểm tra toàn bộ cặp `(i, j, d)` với `i ≠ j` và `d ∈ [-K, K]` — dùng instance
+`(i, 0)` làm "đầu dò" cố định, so với `(j, d)` — là **đủ và cần thiết** để đảm bảo tuần hoàn vô hạn hợp lệ
+giữa hai `TrainService` khác nhau. `K` ở đây là **một cận trên triển khai (implementation bound)** để xác
+định các *relative cycle offset* cần đưa vào kiểm tra cho một bài toán tuần hoàn — **không phải** việc
+solver đang lập lịch cho nhiều ngày độc lập rồi ghép lại; bản thân biến quyết định vẫn chỉ có đúng 1 bộ,
+thuộc `TrainService` tại chu kỳ 0 (mục 0.1).
+
+**Trường hợp `i = j` (một service so với chính bản sao chu kỳ khác của nó) — sửa lại so với bản trước:**
+Bản Phase 1 trước đó đưa `i = j` vào diện phải kiểm tra chỉ dựa trên `JourneyTime > 1440`, và coi đây là
+nguồn self-conflict. **Điều này sai và đã được sửa.** Lý do:
+
+Trên mạng lưới **tuyến tính, mỗi khu gian được một `TrainService` đi qua đúng một lần trong một chu kỳ**,
+occupation của service tại cùng một `Section` giữa hai chu kỳ liên tiếp thoả:
+
+```text
+Occupation(Service, n, Section) = Occupation(Service, 0, Section) + n × 1440
+```
+
+Độ rộng một occupation (= running time của đúng 1 khu gian, tính bằng phút, luôn nhỏ hơn nhiều so với
+1440) không thể đủ lớn để hai occupation của cùng service, cùng section, ở hai chu kỳ liên tiếp
+(`n` và `n+1`, cách nhau đúng 1440 phút) giao nhau. Việc `JourneyTime(Service) > 1440` chỉ có nghĩa là
+**nhiều instance của cùng service cùng tồn tại đồng thời trên các vị trí khác nhau của tuyến** (ví dụ
+SE1/0 đang ở ga 140 trong khi SE1/+1 mới xuất phát ở ga 1) — đây là điều kiện làm cho `K` cần `> 1` để bắt
+đủ các cặp **khác service** đang cùng lúc hiện diện trên tuyến, chứ **không tự nó tạo ra xung đột giữa
+hai instance của cùng một service tại cùng một resource**. Vì vậy:
+
+```text
+Với network tuyến tính hiện tại: LOẠI TRỪ i = j khỏi tập cặp (i,j,d) cần ConflictDetector kiểm tra.
+```
+
+**Giữ lại trong kiến trúc (không xoá code path) cho các trường hợp tương lai** mà self-conflict `i=j` là
+có thật: route dạng vòng (một ga/khu gian được service đi qua nhiều lần trong 1 chu kỳ), hoặc occupation
+của một resource kéo dài xấp xỉ/hơn 1440 phút (không xảy ra với occupation cấp khu gian trong bài toán
+hiện tại, nhưng có thể xảy ra nếu sau này mô hình hoá occupation ở cấp độ khác, vd. chiếm dụng cả 1 depot
+nhiều giờ). `ConflictDetector` nên nhận một cờ cấu hình `IncludeSelfServiceConflicts: bool` (mặc định
+`false` cho tuyến HN–SG tuyến tính hiện tại) thay vì hard-code loại trừ `i=j`, để bật lại không cần đổi
+kiến trúc khi mở rộng mạng lưới.
 
 ### 11.3 Thuật toán detection & validate
 
@@ -805,10 +947,13 @@ ConflictDetector.Detect(services):
         for n in [-K, K]:                       // K tính theo mục 11.2, một lần cho toàn hệ thống
             occupations += SectionOccupation.From(service.Trajectory, cycleIndex = n)
     → chạy sweep-line (mục 5) như bình thường trên TOÀN BỘ occupations này
-    → nhưng chỉ giữ lại Conflict mà ÍT NHẤT MỘT bên có CycleIndex == 0
-      (theo lập luận 11.2: các cặp còn lại (CycleIndex đều ≠ 0) là suy ra được/trùng lặp với
-       một cặp đã có CycleIndex 0, không cần xử lý — chỉ cần khi RESOLVE, ghi decision vào
-       TrainService phía có mặt trong cặp, bất kể cặp đó lấy "đầu dò" là bên nào)
+    → chỉ giữ lại Conflict mà:
+        (a) ÍT NHẤT MỘT bên có CycleIndex == 0   (lập luận 11.2: cặp còn lại là suy ra được/trùng lặp
+                                                    với một cặp đã có CycleIndex 0)
+        (b) hai bên thuộc HAI TrainService KHÁC NHAU (ServiceId khác nhau)   — mặc định
+            (IncludeSelfServiceConflicts = false, xem giải thích ở trên) trên network tuyến tính hiện tại;
+            khi RESOLVE, ghi decision vào TrainService phía có mặt trong cặp, bất kể cặp đó lấy
+            "đầu dò" là bên nào.
 ```
 
 Vì đây là cách `ConflictDetector` hoạt động **mặc định** (không phải một chế độ đặc biệt bật lên sau), nó
@@ -844,11 +989,13 @@ instance `n≠0` không bao giờ được lưu, chỉ tồn tại tạm thời 
    `frontier` rỗng sau một tầng.
 5. **Giới hạn năng lực ga**: nhiều hơn `MaxSimultaneousTrains` của một ga cần đỗ/tránh cùng lúc tại cùng
    thời điểm (ví dụ 3 service cùng cần gặp nhau ở ga chỉ có 2 track).
-6. **Một `TrainService` tự xung đột với chính nó qua chu kỳ** (`i = j`, `d ≠ 0` ở mục 11.2): khi
-   `JourneyTime(T) > 1440` và không đủ slack để tạo giãn cách `SameDirectionHeadway` giữa chuyến hôm nay
-   và chuyến hôm sau/hôm trước của cùng service tại điểm chúng còn gần nhau trên tuyến — đây là nguyên
-   nhân **mới so với bản Phase 1 đầu tiên**, chỉ xuất hiện khi mô hình hoá đúng theo `TrainService`/
-   `TrainInstance` (mục 0.1, 11.2) thay vì coi các ngày độc lập.
+6. ~~Một `TrainService` tự xung đột với chính nó qua chu kỳ~~ — **đã loại bỏ khỏi danh sách nguyên nhân
+   sau khi sửa mục 11.2**: trên network tuyến tính hiện tại, occupation của cùng một service tại cùng một
+   `Section` giữa hai chu kỳ liên tiếp cách nhau đúng 1440 phút, trong khi độ rộng occupation (= running
+   time 1 khu gian) luôn nhỏ hơn nhiều 1440 → không thể tự giao nhau. `JourneyTime > 1440` chỉ tạo ra hiện
+   tượng nhiều instance của cùng service cùng hiện diện trên tuyến, làm `K` (mục 11.2) cần `>1` để bắt đủ
+   xung đột **giữa các service khác nhau**, chứ không phải nguồn tự-xung-đột. Giữ hook kiến trúc
+   (`IncludeSelfServiceConflicts`) cho tương lai (route vòng, resource chiếm dụng dài).
 7. **Vi phạm chu kỳ giữa hai service khác nhau không thể sửa**: sau khi quét đủ `K` theo mục 11.2, phát
    hiện một cặp `(Service_i, Service_j, d)` xung đột mà không còn `ForwardSlack` (và cả
    `RedistributableSlack` đã re-validate) để điều chỉnh, vì `FixedDepartureTimeOfDay` mỗi service là bất
@@ -884,7 +1031,7 @@ Bổ sung thêm (phát sinh từ phân tích ở trên, nên có thêm trước 
 
 | # | Kịch bản | Lý do thêm |
 |---|----------|------------|
-| 11 | Hành trình dài hơn 24h (vd 30h) với 1 service chạy hàng ngày | Kiểm chứng `K > 1` (mục 11.2) VÀ tự động phát hiện self-conflict `(i=j, d=1)` giữa chuyến hôm nay và hôm sau nếu không đủ headway |
+| 11 | Hành trình dài hơn 24h (vd 30h), 2 service KHÁC NHAU cùng hiện diện trên tuyến | Kiểm chứng `K > 1` (mục 11.2) bắt đúng xung đột `(i≠j, d=1)`; đồng thời khẳng định KHÔNG có false-positive self-conflict `(i=j, d≠0)` khi chỉ có 1 service chạy hàng ngày (đúng bản sửa mục 11.2/12) |
 | 12 | Ga chỉ có `CanMeet=true` nhưng `CanOvertake=false` | CandidateGenerator lọc đúng theo `Conflict.Type` |
 | 13 | 3 service cùng cần gặp nhau tại 1 ga chỉ có 2 track | Phát hiện đúng nguyên nhân infeasible #5 (mục 12) |
 | 14 | Reallocate buffer sau khi có nghiệm khả thi (Phase 8) | `SlackReallocationStrategy` (mục 4.2) cải thiện phân bố recovery, có re-validate, không phá vỡ nghiệm đã đúng |

@@ -1,0 +1,15 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <TargetFramework>net8.0</TargetFramework>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <RollForward>LatestMajor</RollForward>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\TrainTimetable.Domain\TrainTimetable.Domain.csproj" />
+    <ProjectReference Include="..\TrainTimetable.Configuration\TrainTimetable.Configuration.csproj" />
+  </ItemGroup>
+
+</Project>
