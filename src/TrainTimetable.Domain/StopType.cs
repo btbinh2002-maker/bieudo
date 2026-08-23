@@ -7,5 +7,6 @@ public enum StopType
     Technical,
     PassengerAndTechnical,
     ForcedMeet,
+    ForcedHeadway,
     ForcedOvertake
 }

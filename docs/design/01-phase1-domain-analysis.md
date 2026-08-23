@@ -152,8 +152,16 @@ Từ danh sách `Tracks`, suy ra:
 Station.CanMeet      = số track UsableForMeet     >= 2
 Station.CanOvertake  = số track UsableForOvertake >= 2   (thường yêu cầu chặt hơn CanMeet:
                         cần 1 track cho tàu nhanh chạy thẳng + 1 track/siding cho tàu chậm đỗ chờ)
+Station.CanHold      = Tracks.Count >= 1   // (mới, 2026-08-23 — bổ sung cho mục 6.1 review)
 Station.MaxSimultaneousTrains = số track khả dụng cùng lúc
 ```
+
+`CanHold` (khác `CanMeet`/`CanOvertake`) trả lời câu hỏi "1 tàu có thể dừng đỗ hợp lệ tại ga này hay
+không", **không đòi hỏi 2 track cùng lúc** — vì HEADWAY (cùng chiều, mục 5.6/6.1) chỉ cần Follower dừng
+lại một mình để nới rộng khoảng cách với Leader, không có tàu ngược chiều nào cần "tránh" tại đúng thời
+điểm đó. Ngưỡng tối thiểu `Tracks.Count >= 1` cố ý lỏng hơn `CanMeet`/`CanOvertake` (vốn cần >= 2) — bất
+kỳ ga vật lý thật nào có ít nhất 1 track hợp lệ đều đáp ứng. Ga ảo/junction placeholder (Điêu Trì Bắc,
+mục 15.13) có `Tracks` rỗng nên `CanHold=false` — tự động bị loại đúng như `CanMeet`/`CanOvertake`.
 
 Lý do tách `StationTrack` thay vì chỉ 2 cờ `CanMeet/CanOvertake` trên `Station`: đề bài yêu cầu
 "khai báo số đường trong ga và khả năng tránh/vượt" — việc mô hình theo track cho phép sau này mở rộng
@@ -281,7 +289,10 @@ TimetableEntry
   StationSeq
   ArrivalTime:  int?           // null nếu là ga xuất phát
   DepartureTime: int?          // null nếu là ga đến cuối
-  StopType: enum { Through, Passenger, Technical, PassengerAndTechnical, ForcedMeet, ForcedOvertake }
+  StopType: enum { Through, Passenger, Technical, PassengerAndTechnical, ForcedMeet, ForcedHeadway,
+                   ForcedOvertake }   // + ForcedHeadway (2026-08-23, review lần 4 — điểm 2): trước đây
+                                      // thiếu case cho candidate HEADWAY, buộc phải mượn tạm ForcedMeet/
+                                      // ForcedOvertake dù bản chất khác (không có tàu ngược chiều/vượt).
   StopDuration: int
   RunningTimeFromPrev: int
   AccelerationApplied: bool
@@ -356,6 +367,67 @@ Conflict
 > (`RequiredHeadwayMinutes`/`ActualGapMinutes`/`HeadwayDeficitMinutes`) để `Conflict` tự mang đủ dữ liệu
 > phân biệt "vi phạm gap thuần tuý" khỏi "overlap vật lý thật" và "đảo thứ tự nhiều Section" — không cần
 > `RequiredShiftCalculator`/`CandidateEvaluator` tính lại từ đầu (mục 5.5 đã tính sẵn khi detect).
+
+> **Làm rõ invariant (2026-08-23, sau review CandidateGenerator — mục 6.3):** `ServiceA/CycleIndexA`
+> **LUÔN LÀ** occupation "Earlier" (EntryTime nhỏ hơn) và `ServiceB/CycleIndexB` **LUÔN LÀ** "Later" —
+> đúng theo cách `ConflictDetector.BuildConflict(sectionId, earlier, later, ...)` đã code (mục 5.5),
+> **không phụ thuộc thứ tự truyền `services` vào `Detect(...)`**. Đây là bất biến có thể dùng trực tiếp,
+> không phải quy ước tùy ý:
+> - **MEET** (ngược chiều): "Earlier"/"Later" chỉ có ý nghĩa thời gian, không có khái niệm
+>   "leader/follower" — cả 2 phía đều có thể được chọn `TrainToWait` (mục 6.3).
+> - **HEADWAY** (cùng chiều): "Earlier" = **Leader** (tàu trước), "Later" = **Follower** (tàu sau) — vì
+>   cùng chiều nên thứ tự entry time trùng với thứ tự vật lý trên tuyến. Chỉ **Follower**
+>   (`ServiceIdB`/`CycleIndexB`) mới được sinh `CandidateSolution` (mục 6.3) — cho Leader chờ sẽ chỉ làm
+>   `Earlier.ExitTime` muộn hơn và làm `ActualGapMinutes` XẤU ĐI, không giải quyết được gì.
+> - **OVERTAKE**: `SlowTrain`/`FastTrain` (mục 7.3) do `ConflictAnalyzer` gán khi reclassify từ chuỗi
+>   HEADWAY (Phase 6, ngoài phạm vi `ConflictDetector`/`CandidateGenerator` hiện tại) — không suy trực
+>   tiếp từ A/B như HEADWAY.
+
+> **Bổ sung API tránh ambiguity (2026-08-23, review lần 3 — điểm 3):** invariant "Earlier=A/Later=B" ở
+> trên là đúng theo code hiện tại, nhưng **bắt buộc bên gọi (`CandidateGenerator`, mục 6) không được tự
+> suy diễn Leader/Follower bằng cách nhớ quy ước A/B** — quy ước đó có thể đổi trong tương lai (vd nếu
+> `BuildConflict` được sửa) và khi đó mọi call-site tự suy diễn sẽ âm thầm sai mà không có gì báo lỗi.
+> `Conflict` (record, mục 1.7) vì vậy có thêm 4 **computed property** (không lưu field riêng, không data
+> trùng lặp — suy thẳng từ `Type`/`ServiceIdA`/`CycleIndexA`/`ServiceIdB`/`CycleIndexB` đã có sẵn):
+>
+> ```text
+> Conflict.LeaderServiceId     => Type == HEADWAY ? ServiceIdA   : throw InvalidOperationException(...)
+> Conflict.LeaderCycleIndex    => Type == HEADWAY ? CycleIndexA  : throw InvalidOperationException(...)
+> Conflict.FollowerServiceId   => Type == HEADWAY ? ServiceIdB   : throw InvalidOperationException(...)
+> Conflict.FollowerCycleIndex  => Type == HEADWAY ? CycleIndexB  : throw InvalidOperationException(...)
+> ```
+>
+> `throw` (không trả `null`/mặc định) khi `Type != HEADWAY` — fail-fast đúng phong cách đã dùng ở
+> `SectionOccupationBuilder` (mục 15.13.7): MEET không có khái niệm Leader/Follower (mục trên), nên gọi
+> nhầm 4 property này trên một `Conflict` MEET là lỗi logic ở tầng gọi, cần lộ ra ngay, không phải một giá
+> trị "hợp lý nhưng sai" lặng lẽ trôi xuống. Toàn bộ mục 6/7 (`CandidateGenerator`,
+> `RequiredShiftCalculator`) cho nhánh HEADWAY từ nay dùng **duy nhất** 4 property này, không bao giờ đọc
+> trực tiếp `ServiceIdA`/`ServiceIdB`/`CycleIndexA`/`CycleIndexB` khi xử lý HEADWAY.
+
+> **Bổ sung 2 helper TỔNG QUÁT (2026-08-23, review lần 5 — chuẩn bị cho MEET, mục 7.1):** khác với
+> Leader/Follower (chỉ có ý nghĩa cho HEADWAY), MEET cần một phép tra cứu "tàu kia là ai" mà **CẢ HAI
+> phía đều hợp lệ** (mục trên: "cả 2 phía đều có thể được chọn `TrainToWait`"). Không thể dùng property
+> cố định như `LeaderServiceId` (không có "bên cố định nào là A hay B" cho MEET) — thay vào đó là 2
+> **method** (nhận `serviceId` đang xét làm tham số), vẫn đặt trên `Conflict` để **giữ đúng 1 nơi** làm
+> phép tra cứu A/B, không rải rác ternary `serviceId == ServiceIdA ? ... : ...` ở từng call-site:
+>
+> ```text
+> Conflict.OtherServiceId(serviceId: string): string
+>     => serviceId == ServiceIdA ? ServiceIdB
+>      : serviceId == ServiceIdB ? ServiceIdA
+>      : throw InvalidOperationException($"{serviceId} khong phai ServiceIdA/ServiceIdB cua Conflict nay")
+>
+> Conflict.CycleIndexOf(serviceId: string): int
+>     => serviceId == ServiceIdA ? CycleIndexA
+>      : serviceId == ServiceIdB ? CycleIndexB
+>      : throw InvalidOperationException($"{serviceId} khong phai ServiceIdA/ServiceIdB cua Conflict nay")
+> ```
+>
+> Dùng chung cho MỌI `Type` (không giới hạn HEADWAY như Leader/Follower) — `RequiredShiftCalculator.ComputeMeet`
+> (mục 7.1, sửa lại) gọi `conflict.OtherServiceId(candidate.TrainToWait)` để biết `P` là ai, và
+> `conflict.CycleIndexOf(...)` cho cả `W` lẫn `P` khi cần đọc `Arrival`/`Departure` **đúng instance** (mục
+> 6.3 đã lưu ý `Conflict` luôn tham chiếu một cặp instance cụ thể, không phải TrainService trần) — xem lý
+> do chi tiết ở mục 7.1.
 
 Một `Conflict` luôn tham chiếu tới **cặp instance cụ thể** (`Service + CycleIndex` cho mỗi bên) vì đó là
 thứ va chạm nhau trên trục thời gian thực; nhưng khi resolve, quyết định sửa luôn ghi ngược lại
@@ -586,10 +658,13 @@ cục bộ.
 > cấu hình") như hai rule có **bản chất khác nhau**. Sai theo đúng nghiệp vụ thực tế: quy tắc gốc là
 > **"Section Release Headway"** — sau khi một tàu ra khỏi khu gian, phải chờ tối thiểu 3 phút thì tàu
 > tiếp theo (BẤT KỂ cùng chiều hay ngược chiều) mới được phép vào khu gian đó. MEET và HEADWAY dùng
-> **chung một điều kiện gap** (`Later.EntryTime − Earlier.ExitTime >= SectionReleaseHeadwayMinutes`),
-> chỉ khác nhau ở: MEET còn phải xét thêm khả năng **overlap vật lý thật sự** (hai tàu ngược chiều tranh
-> chấp khoảng thời gian), còn HEADWAY (cùng chiều) không có khả năng "overlap kiểu MEET" nhưng CÓ khả
-> năng suy biến thành OVERTAKE nếu gap âm đủ sâu (mục 5.4). Toàn bộ mục 5 viết lại theo đúng quy tắc này.
+> **chung một điều kiện gap** (`Later.EntryTime − Earlier.ExitTime >= SectionReleaseHeadwayMinutes`) VÀ
+> **chung cách suy `ConstraintKind`** từ dấu của gap (mục 5.2) — `Type` (MEET/HEADWAY) và `ConstraintKind`
+> (SectionOverlap/SectionReleaseHeadway) là **hai trục độc lập** (mục 5.3): cùng chiều **vẫn có thể** có
+> `ConstraintKind=SectionOverlap` nếu gap âm đủ sâu (tàu sau vào Section trước khi tàu trước ra hẳn dù
+> cùng chiều), không phải "chỉ MEET mới overlap được". HEADWAY còn có thêm khả năng suy biến thành
+> OVERTAKE nếu gap âm sâu **xuyên qua nhiều Section liên tiếp** (mục 5.4, khác với overlap tại một Section
+> đơn lẻ). Toàn bộ mục 5 viết lại theo đúng quy tắc này.
 
 ### 5.1 Section occupation
 
@@ -749,11 +824,11 @@ IHeadwayRules
   SectionReleaseHeadwayMinutes: int = 3   // DÙNG CHUNG cho MEET (ngược chiều) và HEADWAY (cùng chiều),
                                            // đúng nghiệp vụ mục 5.2 — KHÔNG tách MeetHeadway/
                                            // SameDirectionHeadway thành 2 số khác nhau nữa.
-  OvertakeHeadway: int                    // GIỮ RIÊNG — dùng ở mục 7.2 (RequiredShiftCalculator,
+  OvertakeHeadway: int                    // GIỮ RIÊNG — dùng ở mục 7.3 (RequiredShiftCalculator,
                                            // khoảng cách departure sau khi vượt tại ga), khác ngữ cảnh
                                            // với Section Release Headway (đang xét khu gian, không phải
                                            // thời điểm khởi hành sau khi overtake). CHƯA rà soát lại
-                                           // công thức mục 7.2 trong lượt sửa này — để dành khi code
+                                           // công thức mục 7.3 trong lượt sửa này — để dành khi code
                                            // RequiredShiftCalculator thật (Phase 3 resolver), tránh lấn
                                            // phạm vi ngoài yêu cầu hiện tại (chỉ ConflictDetector).
 ```
@@ -807,21 +882,306 @@ ngoại lệ double-track (mục 5.3) đã có sẵn trong thiết kế nhưng c
 
 ## 6. Candidate Generation (mục 11, 14 — câu hỏi 8)
 
-Với một `Conflict` tại Section `(i, i+1)`:
+> **Sửa lại (2026-08-23, sau Phase 3.5 — mục 1.4/15.14):** bản nháp trước định nghĩa candidate window
+> bằng `{i-window .. i+1+window}` trên **một trục `Sequence` dùng chung** giữa Section `(i,i+1)` của
+> conflict và cả 2 tàu — điều này **sai** theo đúng model đã chốt: `Sequence`/`JourneySequence` chỉ có
+> ý nghĩa **cục bộ** trong route của từng `TrainService` (mục 1.4). Hai tàu cùng đi qua một ga vật lý có
+> thể có `JourneySequence` hoàn toàn khác nhau (vd A tại seq 20, B tại seq 78, cùng `StationCode 500`).
+> Candidate station phải định danh bằng **`StationCode`**, không phải `StationSeq`/`Sequence`. Toàn bộ
+> mục 6 viết lại theo model 2 tầng dưới đây.
+
+> **Sửa tiếp (2026-08-23, review lần 2 — 6 điểm)**: bản 2 tầng ở trên còn 6 lỗi/thiếu sót, sửa toàn bộ
+> trong mục 6.0–6.4 dưới đây: (1) anchor phải bắt buộc dùng CẢ HAI đầu Section, không `??` fallback một
+> đầu; (2) HEADWAY không được dùng `CanOvertake` — cần capability riêng `CanHold` (mục 1.1); (3) HEADWAY
+> chỉ được sinh `CandidateSolution` cho Follower (`ServiceB`/Later, mục 1.7), không sinh cho Leader; (4)
+> công thức HEADWAY được thêm vào mục 7.2 (RequiredShiftCalculator); (5) candidate phải nằm ở phần
+> **thượng nguồn** (upstream) của điểm vào Section đang xung đột, xét ĐỘC LẬP trên route của từng bên;
+> (6) `StationCode` đổi kiểu `string` → `int` (khớp cột `StationCode int` trong DB thật, mục 15.x).
+
+> **Sửa tiếp (2026-08-23, review lần 3 — 3 điểm)**: bản review lần 2 còn 3 vấn đề, sửa trong 6.1/6.2/6.4
+> và mục 7.2 dưới đây: (1) `RequiredWaitingMinutes` của HEADWAY phải trừ đi phần deficit mà chính
+> structural `ForcedStop` (+decel/+accel) tự giải quyết — không được cộng thẳng `HeadwayDeficitMinutes`
+> như thể structural không đóng góp gì (mục 7.2); (2) candidate cho HEADWAY **không cần intersection**
+> với route của Leader — chỉ cần nằm thượng nguồn trên CHÍNH route của Follower và thoả `CanHold`, Leader
+> không cần đi qua ga đó; (3) `Conflict` có thêm 4 property tường minh `LeaderServiceId`/
+> `LeaderCycleIndex`/`FollowerServiceId`/`FollowerCycleIndex` (mục 1.7) — `CandidateGenerator` dùng DUY
+> NHẤT các property này cho nhánh HEADWAY, không tự suy diễn qua thứ tự A/B.
+
+### 6.0 Domain DTO
 
 ```text
-CandidateWindow (config, ví dụ 3) →
-  candidate stations = { i-window .. i+1+window } ∩ { ga có CanMeet (nếu Type=MEET)
-                                                        hoặc CanOvertake (nếu Type=OVERTAKE/HEADWAY) }
-                        ∩ { ga nằm trong route còn lại của CẢ HAI tàu, chưa đi qua }
+TrainServiceRoute                              // KHÔNG phải type mới trong Domain — chỉ là cách gọi
+  Trajectory: TrainServiceTrajectory            // cặp (Trajectory, Network) đã có sẵn (mục 1.5, 15.14)
+  Network: RailwayNetwork                       // network CỦA RIÊNG service này (mục 1.4/15.14)
+
+  StationCodeAt(localIndex: int): int           // = Network.GetStation(Trajectory.Entries[localIndex]
+                                                 //   .StationSequence).Code — KHÔNG lưu thêm field nào
+                                                 //   trên TimetableEntry, chỉ là một phép tra cứu.
+                                                 //   KIỂU int (sửa điểm 6) — khớp cột StationCode int
+                                                 //   trong DB thật; Domain.Station.Code hiện là string
+                                                 //   (mục 15.11, khoảng hở CHƯA giải quyết) nên phép tra
+                                                 //   cứu này tạm thời phải parse/convert — ghi chú rõ để
+                                                 //   không quên khi code thật (không phải việc của mục 6)
+
+PhysicalCandidateStation
+  StationCode: int        // sửa điểm 6 (trước là string)
+  CanMeet: bool            // đọc từ Station vật lý (mục 1.1) — PHẢI giống nhau dù tra qua network của
+  CanOvertake: bool        // service nào (cùng 1 hạ tầng vật lý); nếu 2 network báo lệch nhau, đây là
+  CanHold: bool            // lỗi dữ liệu cần validate ở Phase 2.5, KHÔNG phải việc CandidateGenerator xử
+                           // lý. CanHold mới (sửa điểm 2, mục 1.1) — dùng riêng cho HEADWAY, KHÔNG dùng
+                           // CanOvertake cho HEADWAY (xem lý do ở mục 6.1)
+
+CandidateStationBinding           // sửa (2026-08-23, review lần 5) — đổi tên tu CandidateStationContext,
+  StationCode: int                // theo dung de xuat cua nguoi dung; CHI dung NOI BO trong thuat toan
+  ServiceAId: string              // GenerateMeetCandidates (muc 6.1) - KHONG phai field cua CandidateSolution
+  ServiceALocalIndex: int         // (xem ly do o CandidateSolution ben duoi). HEADWAY KHONG tao Binding
+  ServiceBId: string              // (nhanh HEADWAY khong can intersection 2 route, muc 6.1) - dung theo
+  ServiceBLocalIndex: int         // de xuat cua nguoi dung "khong bat buoc tao binding du 2 phia cho HEADWAY".
+
+PhysicalSectionCatalog                          // registry riêng, KHÔNG phải RailwayNetwork toàn cục
+  Lookup(SectionId: string) -> (FromStationCode: int, ToStationCode: int)   // sửa điểm 6
+                                   // xây 1 lần khi Section được tạo (SectionId vốn đã suy từ đúng cặp
+                                   // StationCode này, mục 1.4/15.14) — CandidateGenerator dùng để biết
+                                   // 2 đầu vật lý của Section đang xung đột mà KHÔNG cần suy ngược từ
+                                   // định dạng chuỗi SectionId (tránh coupling ngầm vào 1 quy ước string).
+                                   // SectionId TỰ NÓ vẫn là string (không đổi) — chỉ 2 đầu StationCode
+                                   // trả về là int
+
+CandidateSolution                               // sửa (2026-08-23, review lần 5) — thêm OtherTrainLocalStationIndex
+  Conflict
+  CandidateStationCode: int
+  TrainToWait: ServiceId                        // = W. LUON la conflict.ServiceIdA hoac conflict.ServiceIdB
+  TrainToWaitLocalStationIndex: int             // ĐÃ RESOLVE SẴN lúc generate (tren route cua W)
+  OtherTrainLocalStationIndex: int?             // MOI - ĐÃ RESOLVE SẴN local index cua "tau kia" (P) TAI
+                                                 // CUNG CandidateStationCode, tren route CUA P. Chi co gia
+                                                 // tri (khong null) khi Conflict.Type == MEET; null cho
+                                                 // HEADWAY (khong bat buoc, theo de xuat cua nguoi dung).
+                                                 // KHONG luu OtherTrainServiceId rieng - suy qua
+                                                 // conflict.OtherServiceId(TrainToWait) (muc 1.7), tranh
+                                                 // du lieu trung lap (Conflict la nguon du lieu goc cho
+                                                 // cap Service/CycleIndex, CandidateSolution khong nhac lai).
 ```
 
-Với mỗi candidate station `S`, sinh **2 CandidateSolution** (train nào chờ):
-`{Conflict, CandidateStation=S, TrainToWait=A}` và `{..., TrainToWait=B}`.
+Không cần thêm field nào vào `Domain` đã commit (`TimetableEntry`, `Section`) — `StationCode` luôn tra qua
+`Network.GetStation(...).Code` của đúng service đang xét, đúng tinh thần "không nhồi thông tin lặp" (mục
+15.14). `PhysicalSectionCatalog` tách riêng khỏi `Conflict`/`SectionOccupation` theo đúng lựa chọn đã chốt
+(tránh trùng lặp dữ liệu vào `Conflict`). `Conflict` CÓ được sửa lần này (mục 1.7) — thêm 2 method
+`OtherServiceId`/`CycleIndexOf` — nhưng đó là 2 **method suy diễn thuần** (không lưu field mới), không vi
+phạm nguyên tắc "không nhồi thông tin lặp".
 
-Prefilter rẻ trước khi tính RequiredShift đầy đủ: loại ngay candidate nếu
-`ForwardSlack(TrainToWait, S) < 0` (mục 4.1) hoặc `S` không nằm giữa vị trí hiện tại và đích của tàu đó —
-tránh tính toán thừa (liên quan tới yêu cầu hiệu năng mục 29).
+> **Vì sao KHÔNG đưa `CandidateStationBinding` (đầy đủ cả 2 phía) trực tiếp vào `CandidateSolution` như
+> đề xuất ban đầu** (`CandidateSolution { Conflict, Binding, TrainToWait }`): nếu làm vậy, MỌI nơi tiêu thụ
+> `CandidateSolution` (`RequiredShiftCalculator`, `ForcedStopMutator`, `ForwardSlack`...) đều phải tự viết
+> lại phép so khớp `TrainToWait == Binding.ServiceAId ? Binding.ServiceALocalIndex :
+> Binding.ServiceBLocalIndex` mỗi khi cần local index CỦA CHÍNH W — đúng loại "tra lại mơ hồ sau này" mà
+> yêu cầu ban đầu muốn tránh, và phá vỡ ranh giới đã chốt ở mục 6.3 ("`TrainToWaitLocalStationIndex` đã
+> resolve sẵn, không tự resolve lại"). Giữ nguyên `TrainToWaitLocalStationIndex` (đã có, đã test) làm
+> field chính, chỉ thêm `OtherTrainLocalStationIndex` cạnh nó — cả 2 đều đã ở đúng "góc nhìn" của chính
+> `CandidateSolution` này (W là ai đã cố định lúc emit), không cần tra cứu thêm bước nào. `CandidateStationBinding` vẫn đúng như
+> đề xuất, chỉ giới hạn phạm vi là **cấu trúc trung gian lúc generate** (mục 6.1), không rò rỉ ra ngoài.
+
+### 6.1 Thuật toán — tách 2 nhánh theo Type (sửa điểm 2, review lần 3)
+
+> **Vì sao tách nhánh thay vì 1 thuật toán chung**: bản review lần 2 dùng chung 1 pipeline
+> "intersection 2 route rồi mới lọc theo Type" cho cả MEET và HEADWAY — điều này **sai cho HEADWAY**:
+> HEADWAY chỉ có MỘT bên (Follower) cần dừng chờ, Leader **không bắt buộc phải đi qua candidate station**
+> (ví dụ Follower đi A-B-C-D-[conflict], Leader chỉ đi C-D-[conflict] — ga `B` vẫn là candidate hợp lệ
+> cho Follower dù Leader chưa từng "thấy" ga `B`). Bắt Leader cũng phải đi qua candidate station là một
+> ràng buộc thừa, có thể loại bỏ nhầm những candidate hợp lệ. Vì vậy 2 nhánh dùng 2 hàm riêng, chỉ dùng
+> chung 2 helper thuần (`IndexOfStationCode`, `LocalStationsWithinWindow`) và `capabilityLookup`.
+
+```text
+GenerateCandidates(conflict, routeA, routeB, catalog, capabilityLookup, window):
+    (fromCode, toCode) := catalog.Lookup(conflict.SectionId)
+
+    if conflict.Type == MEET:
+        return GenerateMeetCandidates(conflict, routeA, routeB, fromCode, toCode, capabilityLookup, window)
+    else if conflict.Type == HEADWAY:
+        // sua diem 3 (review lan 3): lay Follower's route qua Conflict.FollowerServiceId (muc 1.7),
+        // KHONG tu suy dien "B luon la Follower" bang cach nho quy uoc:
+        followerRoute := (conflict.FollowerServiceId == conflict.ServiceIdA) ? routeA : routeB
+        return GenerateHeadwayCandidates(conflict, followerRoute, fromCode, toCode, capabilityLookup, window)
+    // Type == OVERTAKE khong bao gio toi day (muc 5.5/6.1 buoc 4 cu) - ConflictDetector chua bao gio
+    // sinh Type=OVERTAKE, day la viec cua ConflictAnalyzer (Phase 6, ngoai pham vi)
+```
+
+**Nhánh MEET** (giữ nguyên logic dual-endpoint + intersection + upstream-per-side của review lần 2 —
+KHÔNG đổi, vì với MEET cả 2 tàu đều thực sự phải đi qua chính Section đang xung đột nên cả 2 route đều
+BẮT BUỘC chứa `fromCode`/`toCode`, intersection vẫn đúng nghiệp vụ):
+
+```text
+GenerateMeetCandidates(conflict, routeA, routeB, fromCode, toCode, capabilityLookup, window):
+    // Buoc 1 - anchor BAT BUOC ca hai dau tren CA HAI route (moi occupation deu sinh tu dung 1 cap
+    // StationCode lien tiep tren chinh route cua no - SectionOccupationBuilder, muc 1.6/15.13):
+    idxA_from := IndexOfStationCode(routeA, fromCode)
+    idxA_to   := IndexOfStationCode(routeA, toCode)
+    idxB_from := IndexOfStationCode(routeB, fromCode)
+    idxB_to   := IndexOfStationCode(routeB, toCode)
+    if any of these is "khong tim thay":
+        throw InvariantViolation(
+            "Conflict.SectionId khong khop voi route cua chinh tau da sinh ra occupation nay - " +
+            "loi du lieu o PhysicalSectionCatalog/SectionOccupationBuilder, KHONG duoc silent-fallback")
+
+    entryIdxA := min(idxA_from, idxA_to)
+    exitIdxA  := max(idxA_from, idxA_to)
+    entryIdxB := min(idxB_from, idxB_to)
+    exitIdxB  := max(idxB_from, idxB_to)
+
+    // Buoc 2 - di doc route CUC BO cua tung ben, cua so tinh tren CA HAI dau cua CHINH conflict nay:
+    candidatesA := LocalStationsWithinWindow(routeA, entryIdxA, exitIdxA, window)  // list (localIndex, StationCode)
+    candidatesB := LocalStationsWithinWindow(routeB, entryIdxB, exitIdxB, window)
+
+    // Buoc 3 - CHI MEET moi can intersection: ca 2 tau deu thuc su di qua chinh Section xung dot nen ca
+    // 2 route deu la ung vien hop le cho ga dung chung:
+    physicalCandidates := { code : code xuat hien trong CA candidatesA VA candidatesB }
+
+    foreach code in physicalCandidates:
+        station := capabilityLookup(code)
+        if not station.CanMeet: continue
+
+        // sua (review lan 5): CandidateStationContext -> CandidateStationBinding (doi ten, cung du lieu) -
+        // van CHI dung NOI BO trong vong lap nay, KHONG rieng CandidateSolution (xem ly do muc 6.0):
+        binding := CandidateStationBinding {
+            StationCode = code,
+            ServiceAId = conflict.ServiceIdA,
+            ServiceALocalIndex = candidatesA.First(c => c.StationCode == code).LocalIndex,
+            ServiceBId = conflict.ServiceIdB,
+            ServiceBLocalIndex = candidatesB.First(c => c.StationCode == code).LocalIndex
+        }
+
+        // Buoc 4 - upstream filter, XET DOC LAP tung ben: candidate chi hop le lam "TrainToWait" cho
+        // MOT ben neu no nam o thuong nguon cua diem VAO Section dang xung dot TREN CHINH route cua ben
+        // do. A va B co the co vung thuong nguon hop le khac nhau. MOI emit (sua review lan 5) dinh kem
+        // luon OtherTrainLocalStationIndex = local index cua BEN KIA tai CUNG StationCode nay - da co san
+        // trong binding, KHONG can tra lai o RequiredShiftCalculator (muc 6.0/6.3).
+        //
+        // Buoc 5 - invariant Arrival/Departure PHAI TON TAI (moi, review lan 6 - chot huong xu ly M6):
+        // xet THEO TUNG HUONG (W-waits/P-passes) DOC LAP, SAU KHI da xac dinh W/P cho huong do - KHONG
+        // loai ca physical station, chi loai DUNG 1 trong 2 huong neu huong do vo nghia:
+        //   - Waiting train W:  Departure(W, S) phai ton tai  (S khong phai destination cua W - W khong
+        //                        the "cho roi khoi hanh" tai ga cuoi hanh trinh cua chinh no)
+        //   - Passing train P:  Arrival(P, S) phai ton tai    (S khong phai origin cua P - neu P XUAT PHAT
+        //                        tai S, khong co su kien "P den S roi giai phong khu gian" de W cho theo)
+        // KHONG fallback Arrival(P,S)==null sang Departure(P,S) - ban chat vat ly khac nhau (xem mục 7.1):
+        // Departure khong phai "thoi diem giai phong khu gian dan vao S", nen khong duoc dung thay the.
+        if binding.ServiceALocalIndex <= entryIdxA
+           and routeA.Trajectory.Entries[binding.ServiceALocalIndex].DepartureTimeMinutes != null
+           and routeB.Trajectory.Entries[binding.ServiceBLocalIndex].ArrivalTimeMinutes != null:
+            emit CandidateSolution {
+                conflict, binding.StationCode,
+                TrainToWait = binding.ServiceAId, TrainToWaitLocalStationIndex = binding.ServiceALocalIndex,
+                OtherTrainLocalStationIndex = binding.ServiceBLocalIndex
+            }
+        if binding.ServiceBLocalIndex <= entryIdxB
+           and routeB.Trajectory.Entries[binding.ServiceBLocalIndex].DepartureTimeMinutes != null
+           and routeA.Trajectory.Entries[binding.ServiceALocalIndex].ArrivalTimeMinutes != null:
+            emit CandidateSolution {
+                conflict, binding.StationCode,
+                TrainToWait = binding.ServiceBId, TrainToWaitLocalStationIndex = binding.ServiceBLocalIndex,
+                OtherTrainLocalStationIndex = binding.ServiceALocalIndex
+            }
+```
+
+**Nhánh HEADWAY** (mới, sửa điểm 2 — review lần 3: **không intersection**, chỉ xét route của Follower):
+
+```text
+GenerateHeadwayCandidates(conflict, followerRoute, fromCode, toCode, capabilityLookup, window):
+    // Buoc 1 - anchor CHI tren route cua Follower (khong dong cham route cua Leader o day):
+    idxFollower_from := IndexOfStationCode(followerRoute, fromCode)
+    idxFollower_to   := IndexOfStationCode(followerRoute, toCode)
+    if either "khong tim thay":
+        throw InvariantViolation("... (giong ly do o nhanh MEET, ap dung cho route cua Follower)")
+
+    entryIdxFollower := min(idxFollower_from, idxFollower_to)
+    exitIdxFollower  := max(idxFollower_from, idxFollower_to)
+
+    // Buoc 2 - di doc route CUC BO cua Follower, KHONG can biet Leader co di qua khu vuc nay hay khong:
+    candidatesFollower := LocalStationsWithinWindow(followerRoute, entryIdxFollower, exitIdxFollower, window)
+
+    // Buoc 3 - KHONG co buoc intersection (khac MEET) - loc truc tiep tung candidate cua rieng Follower:
+    foreach (localIndex, code) in candidatesFollower:
+        if localIndex > entryIdxFollower: continue          // upstream filter (cung y nghia nhu MEET)
+
+        station := capabilityLookup(code)
+        if not station.CanHold: continue                    // HEADWAY dung CanHold, KHONG dung CanMeet/
+                                                              // CanOvertake (ConflictDetector chua bao
+                                                              // gio sinh Type=OVERTAKE - muc 5.5)
+
+        emit CandidateSolution {
+            conflict, CandidateStationCode = code,
+            TrainToWait = conflict.FollowerServiceId,        // sua diem 3 - KHONG doc ServiceIdB truc tiep
+            TrainToWaitLocalStationIndex = localIndex
+        }
+```
+
+`LocalStationsWithinWindow(route, entryIdx, exitIdx, window)` = `route.Entries[max(0,entryIdx-window) ..
+min(N-1, exitIdx+window)]` — thuần vị trí trong MẢNG cục bộ của route đó, không có phép cộng/trừ nào
+trên một trục Sequence dùng chung, và bao trùm CẢ đoạn `[entryIdx, exitIdx]` của chính conflict trên
+route đó. Đây chính là ý nghĩa đúng của `CandidateWindow=3`: "tối đa 3 ga trước/sau đoạn conflict theo
+route cục bộ của tàu đang xét", không phải "±3 quanh 1 điểm neo" hay "±3 trên một global station sequence".
+
+**MEET**: không yêu cầu candidate phải có cùng `JourneySequence` giữa A và B — `CandidateStationContext`
+lưu 2 local index RIÊNG BIỆT (`ServiceAJourneySequence` có thể là 20, `ServiceBJourneySequence` có thể là
+78, cùng trỏ tới một `StationCode` vật lý).
+
+**HEADWAY**: không dùng `CandidateStationContext` (không cần biết Leader ở đâu, hoặc có ở candidate
+station này hay không) — `CandidateSolution` sinh thẳng từ `(localIndex, StationCode)` trên route của
+Follower.
+
+**Vì sao "upstream" chỉ so `<= entryIdx`, không so `exitIdx` (cả 2 nhánh)**: tàu phải **dừng lại trước
+khi** đi vào chính Section đang xung đột — một ga nằm sau `exitIdx` (đã đi qua Section rồi) không còn tác
+dụng giải quyết xung đột đó nữa, dù nó vẫn có thể lọt qua bước window (`[entryIdx-window, exitIdx+window]`
+nhưng phía sau `exitIdx`). Việc so `<= entryIdx` (không phải `< entryIdx`) cho phép chính ga đầu Section
+cũng là một candidate hợp lệ (tàu dừng ngay tại cửa ngõ trước khi vào khu gian).
+
+### 6.2 Ngoại lệ ga nhánh/terminal (Qui Nhơn, Phan Thiết) — không cần code riêng
+
+`CandidateGenerator` **không hard-code** biết ga nào là ga nhánh (đúng nguyên tắc "semantic một chỗ",
+mục 15.13/15.14). Vì mục 6.1 (sửa điểm 2, review lần 3) tách 2 nhánh khác nhau cho MEET/HEADWAY, số lớp
+phòng thủ khớp ga ảo/junction cũng **khác nhau giữa 2 nhánh** — không còn là "2 lớp cho mọi Type" như bản
+review lần 2:
+
+**MEET** (vẫn có intersection, mục 6.1 nhánh MEET) — 2 lớp phòng thủ cộng hưởng:
+
+1. Với tàu **bypass**, `TimetableEntry` tại ga ảo/ga nhánh vẫn tồn tại trên trajectory (logical row,
+   running=0 — mục 15.13), nên **có thể** lọt vào `candidatesA`/`candidatesB` bằng `StationCode`. Nhưng
+   nó chỉ trở thành `CandidateStationContext` thật nếu StationCode đó cũng xuất hiện trên route của
+   **cả hai** tàu (bước intersection) — với tàu **không** đi/đến ga nhánh đó, StationCode ga nhánh chỉ
+   xuất hiện trên route của **tàu bypass**, không xuất hiện trên route của tàu kia (trừ khi tàu kia
+   cũng đi qua đúng khu vực đó), nên hiếm khi sống sót qua bước intersection.
+2. **Lưới an toàn thứ hai**: ga ảo/junction placeholder (vd Diêu Trì Bắc `31180`) không phải một ga vật
+   lý có track tránh/vượt thật — `CanMeet` của nó phải là `false` (`Tracks` rỗng, mục 1.1), nên dù có lọt
+   qua bước intersection, bước lọc capability ở mục 6.1 vẫn loại nó ra.
+
+**HEADWAY** (KHÔNG có intersection, mục 6.1 nhánh HEADWAY — sửa điểm 2) — chỉ còn **đúng 1 lớp**: ga ảo
+không được đi qua bởi Follower thì đơn giản không có mặt trong `candidatesFollower` ngay từ bước 2 (không
+có khái niệm "lọt qua intersection" ở nhánh này để nói tới lớp 1); nếu Follower **có** đi qua ga ảo đó
+(trường hợp chính Follower là tàu bypass), lớp phòng thủ duy nhất còn lại là `CanHold=false` (`Tracks`
+rỗng, mục 1.1) ở bước 3. **Không được giả định HEADWAY có 2 lớp như MEET** khi viết test.
+
+Test bắt buộc (mục 6.4) phải verify đúng số lớp phòng thủ của TỪNG nhánh, không áp dụng máy móc "2 lớp"
+cho cả HEADWAY.
+
+### 6.3 Ranh giới với `RequiredShiftCalculator` (mục 7.0)
+
+`CandidateSolution.TrainToWaitLocalStationIndex` **đã được resolve xong tại thời điểm generate**
+(mục 6.1) — `RequiredShiftCalculator` (mục 7) nhận thẳng field này, **không tự resolve lại**
+`CandidateStationCode` → local index. Đây là ranh giới bắt buộc giữ xuyên suốt
+`CandidateGenerator` → `RequiredShiftCalculator` → `TrajectoryPropagator`/beam search:
+
+```text
+Inter-service reasoning   (so sánh/tương quan GIỮA nhiều TrainService)  → StationCode / SectionId
+Intra-service mutation    (đọc/sửa trajectory CỦA MỘT TrainService)     → local JourneySequence/index
+```
+
+`ForwardSlack`, `ApplyForcedStop`, `TrajectoryPropagator.InsertDelay` (mục 4.1, 7.0, 8) tiếp tục dùng
+local index y như đã code ở Phase 2 — **đúng**, không cần đổi gì ở các hàm đó; điểm cần đổi chỉ là
+**nơi gọi chúng phải truyền `TrainToWaitLocalStationIndex` đã resolve sẵn**, không truyền
+`CandidateStationCode` xuống các hàm nội bộ này.
+
+Prefilter rẻ trước khi tính `RequiredShift` đầy đủ (không đổi so với bản nháp trước, chỉ đổi tham số):
+loại ngay candidate nếu `ForwardSlack(TrainToWait, TrainToWaitLocalStationIndex) < 0` (mục 4.1) — tránh
+tính toán thừa (yêu cầu hiệu năng mục 29).
 
 Lưu ý: `Conflict` tham chiếu tới một cặp **instance** cụ thể (`ServiceA/CycleIndexA`,
 `ServiceB/CycleIndexB` — mục 1.7), nhưng `TrainToWait` trong `CandidateSolution` luôn được hiểu là
@@ -831,11 +1191,64 @@ rồi khi tính `RequiredShift` xong mới quy đổi ngược lại thành delt
 biến qua phép dịch nên không cần trừ lại `CycleIndex×1440` — chỉ *đọc* qua instance, *ghi* delta thuần tuý
 vào service).
 
+**`SectionTimingResolver`** (helper mới, 2026-08-23 — review lần 4, điểm 1): dùng chung bởi mục 7 khi cần
+đọc thời điểm Entry/Exit **thực tế** của MỘT service tại một `SectionId` cho trước, tránh mỗi công thức tự
+viết lại phép tìm cặp `TimetableEntry` giáp `Section` (đã có sẵn logic này ở `SectionOccupationBuilder`,
+mục 1.6/15.13 — không viết lại, chỉ lọc kết quả có sẵn):
+
+```text
+SectionTimingResolver
+  GetEntryTime(service, trajectory, network, sectionId, cycleIndex): int =
+      SectionOccupationBuilder.BuildForCycle(service, trajectory, network, cycleIndex)
+          .Single(o => o.SectionId == sectionId)
+          .EntryTimeMinutes
+
+  GetExitTime(service, trajectory, network, sectionId, cycleIndex): int =
+      SectionOccupationBuilder.BuildForCycle(service, trajectory, network, cycleIndex)
+          .Single(o => o.SectionId == sectionId)
+          .ExitTimeMinutes
+```
+
+`trajectory` truyền vào **có thể là bản preview** (mục 7.2) thay vì trajectory thật của service — cùng một
+resolver dùng được cho cả 2 trường hợp, vì nó chỉ đọc dữ liệu từ đúng `trajectory` được truyền, không tự ý
+lấy trajectory "chính thức" của service từ đâu khác.
+
+### 6.4 Test bắt buộc (spec — chưa code, dùng khi viết `CandidateGeneratorTests`)
+
+| # | Kịch bản | Kết quả mong đợi |
+|---|----------|-------------------|
+| 1 | A có candidate `StationCode=500` tại local seq 20; B có candidate `StationCode=500` tại local seq 78 | Sinh **đúng 1** `CandidateStationContext{StationCode=500, ServiceAJourneySequence=20, ServiceBJourneySequence=78}` — **không** yêu cầu 2 seq bằng nhau |
+| 2 | A tại local seq 20 = `StationCode 500`; B tại local seq 20 = `StationCode 900` (trùng seq, khác StationCode) | **Tuyệt đối không** coi đây là cùng 1 candidate — 0 candidate tại seq 20 (trừ khi 500/900 trùng bằng cách khác) |
+| 3 | Cả 2 tàu cùng đi qua ga vật lý `StationCode=X` nhưng ga đó có `CanMeet=false` (Type=MEET) | Không sinh candidate tại `X`, dù nó sống sót qua bước intersection |
+| 4 | `Type=MEET`; tàu bypass qua ga nhánh (StationCode ảo, `CanMeet=false` vì không phải track thật) và tàu kia không hề đi qua khu vực đó | Không sinh candidate tại ga nhánh đó — verify CẢ 2 lớp phòng thủ mục 6.2 nhánh MEET (không lọt intersection VÀ nếu có lọt thì bị chặn ở `CanMeet`) |
+| 5 | Tàu bypass và tàu terminal tại Qui Nhơn/Phan Thiết, `JourneySequence` khác nhau hoàn toàn, nhưng có đoạn tuyến chính thật sự dùng chung (StationCode thật, không phải ga ảo), `Type=MEET` | Vẫn sinh đúng candidate tại các `StationCode` dùng chung đó, với 2 local index riêng biệt đúng theo từng tàu |
+| 6 | `CandidateWindow=3`, 2 tàu có route dài khác nhau (A dài 178 ga, B dài 22 ga) | Cửa sổ tìm kiếm luôn đúng "tối đa 3 vị trí mảng" tính từ điểm neo trên CHÍNH route của từng tàu — không phụ thuộc độ dài route của tàu kia |
+| 7 | `PhysicalSectionCatalog.Lookup(conflict.SectionId)` trả về `(fromCode, toCode)` nhưng `toCode` KHÔNG tồn tại trên route của tàu đã thực sự tạo ra occupation đó (lỗi dữ liệu catalog/`SectionOccupationBuilder` không khớp nhau) | `GenerateCandidates`/`GenerateMeetCandidates`/`GenerateHeadwayCandidates` **throw invariant violation** ngay tại bước 1 (mục 6.1) — **không** được âm thầm fallback dùng một mình `fromCode` |
+| 8 | Ga `X` có `CanMeet=false`, `CanOvertake=false`, `CanHold=true`; conflict `Type=HEADWAY`, Follower đi qua `X` (Leader đi qua hay không **không được xét tới** — sửa điểm 2, review lần 3) | **Vẫn sinh** candidate tại `X` cho Follower — HEADWAY chỉ cần `CanHold`, không cần `CanOvertake`/`CanMeet`, và không cần biết Leader có đi qua `X` hay không |
+| 9 | Ga `Y` có `CanHold=false` (0 track, vd ga ảo); conflict `Type=HEADWAY`, Follower "đi qua" `Y` (trường hợp chính Follower là tàu bypass, mục 6.2 nhánh HEADWAY) | Không sinh candidate tại `Y` — bị chặn bởi `CanHold=false` (lớp phòng thủ DUY NHẤT của nhánh HEADWAY, không có lớp intersection) |
+| 10 | Conflict `Type=HEADWAY`; ga `Z` hợp lệ (`CanHold=true`) và nằm thượng nguồn trên route của Follower; Leader **cũng** tình cờ đi qua `Z` | Chỉ sinh **1** `CandidateSolution{TrainToWait=conflict.FollowerServiceId}` tại `Z` — **tuyệt đối không** sinh cho Leader (`conflict.LeaderServiceId`, mục 1.7), việc Leader có đi qua `Z` hay không **không ảnh hưởng** tới kết quả (nhánh HEADWAY không đọc route của Leader) |
+| 11 | Conflict `Type=MEET`; ga `Q` nằm thượng nguồn (`localIndex <= entryIdx`) của Section xung đột trên route của A, nhưng nằm **hạ nguồn** (`localIndex > entryIdx`) trên route của B (B đã đi qua `Q` rồi mới tới Section này) | Chỉ sinh `CandidateSolution{TrainToWait=conflict.ServiceIdA}` tại `Q` — **không** sinh cho B (B không thể "quay lại" `Q` để chờ), dù `Q` sống sót qua bước intersection (mục 6.1 nhánh MEET, bước 4) |
+| 12 | Conflict `Type=HEADWAY`; ga `Z` hợp lệ cho Follower, local index của Follower tại `Z` là 55 | `CandidateSolution.TrainToWaitLocalStationIndex == 55` — đúng local index CỦA Follower tại `Z`, sẵn sàng truyền thẳng cho `RequiredShiftCalculator` (mục 6.3/7.2) mà không cần resolve lại từ `CandidateStationCode` |
+| 13 | Conflict `Type=HEADWAY`; Follower đi A→B→C→D→[conflict], Leader chỉ đi C→D→[conflict] (Leader **không hề có** `StationCode=B` trên route của nó, không phải chỉ nằm ngoài window); `B` có `CanHold=true` và nằm thượng nguồn trên route Follower | **Vẫn sinh** `CandidateSolution` tại `B` cho Follower — minh hoạ trực tiếp điểm 2 (review lần 3): HEADWAY không cần intersection, Leader hoàn toàn không cần "biết" tới ga `B` |
+| 14 | (review lần 6, chốt hướng xử lý cạnh biên mục 7.1) `Type=MEET`; candidate `S` là **ga xuất phát của P** (`ArrivalTimeMinutes(P,S)=null`); `W` có `Departure` hợp lệ tại `S` | **Không** sinh `CandidateSolution{TrainToWait=W}` cho hướng này — `ComputeMeet` (mục 7.1) không bao giờ nhận được candidate có `Arrival(P,S)=null`, vì bị loại ngay tại đây (bước 5, mục 6.1), không fallback sang `Departure(P,S)` |
+| 15 | Cùng physical station `S` như test 14: hướng `W-waits` bị loại (P xuất phát tại S), nhưng `W` có `Arrival` hợp lệ tại `S` | Hướng đối xứng vẫn hợp lệ — **chỉ** sinh `CandidateSolution{TrainToWait=P}` (P chờ, W đi qua) — xác nhận bước 5 chỉ loại ĐÚNG 1 HƯỚNG, không loại bỏ cả physical station khỏi mọi phương án |
+| 16 | `Type=MEET`; candidate `S` là **ga đến (destination)** của `W` (`DepartureTimeMinutes(W,S)=null`) | **Không** sinh `CandidateSolution{TrainToWait=W}` — "W chờ rồi khởi hành khỏi S" vô nghĩa khi S là ga cuối hành trình của W (bước 5, mục 6.1, vế còn lại của cùng invariant) |
+
 ---
 
 ## 7. RequiredShiftCalculator (mục 12 — câu hỏi 9)
 
 Đây là hàm nghiệp vụ trung tâm, tách bạch theo `Conflict.Type`.
+
+> **Ranh giới bắt buộc (2026-08-23, sau Phase 3.5 — mục 6.3):** mọi ký hiệu ga `S` xuất hiện xuyên suốt
+> mục 7 (`Arrival(W,S)`, `ApplyForcedStop(T,S)`, ...) đều là **local `StationSequence`/index của CHÍNH
+> `TrainService` đang xét** — cụ thể là `CandidateSolution.TrainToWaitLocalStationIndex`, ĐÃ ĐƯỢC
+> `CandidateGenerator` resolve sẵn từ `CandidateStationCode` (mục 6.1/6.3) trước khi
+> `RequiredShiftCalculator` được gọi. `RequiredShiftCalculator` **không** nhận `StationCode` và
+> **không tự resolve lại** — nó chỉ làm việc ở tầng intra-service (local index), đúng ranh giới:
+> `Inter-service reasoning → StationCode/SectionId` (thuộc `CandidateGenerator`, mục 6) vs.
+> `Intra-service mutation → local index` (thuộc `RequiredShiftCalculator`/`TrajectoryPropagator`, mục
+> 7/8). Không đổi bất kỳ công thức nào dưới đây — chỉ làm rõ `S` nghĩa là gì sau Phase 3.5.
 
 ### 7.0 Quyết định kiến trúc (sau review Phase 2): KHÔNG gộp Accel/Decel/Waiting thành một scalar
 
@@ -855,8 +1268,11 @@ Section S-1 → S      Ga S            Section S → S+1
    thuộc headway với tàu kia, cố định vị trí trên trajectory:
 
    ```text
-   ApplyForcedStop(T, S):
-       StopType(S)                := ForcedMeet | ForcedOvertake
+   ForcedStopReason: enum { Meet, Headway, Overtake }   // mới (2026-08-23, review lần 4 — điểm 2)
+
+   ApplyForcedStop(T, S, reason: ForcedStopReason):
+       StopType(S)                := reason switch { Meet => ForcedMeet, Headway => ForcedHeadway,
+                                                       Overtake => ForcedOvertake }
        RunningTimeFromPrev(S)     += DecelerationPenalty     // khu gian (S-1 → S)
        RunningTimeFromPrev(S+1)   += AccelerationPenalty     // khu gian (S → S+1)
        // Arrival(S) tăng đúng DecelerationPenalty; từ S+1 trở đi, phần dôi ra
@@ -864,6 +1280,11 @@ Section S-1 → S      Ga S            Section S → S+1
        // ĐÚNG cơ chế propagation ở mục 8 (hấp thụ dần vào RecoveryTimeFromPrev phía sau),
        // neo carry bắt đầu từ S+1 — KHÔNG neo tại S, vì DecelerationPenalty đã "tiêu" cục bộ
        // ngay trong RunningTimeFromPrev(S) chứ chưa cần propagate.
+       // `reason` CHỈ ảnh hưởng StopType (mục 1.5) được gán — logic accel/decel/propagation
+       // dùng CHUNG một nhánh code cho cả 3 reason, KHÔNG duplicate (điểm 2, review lần 4):
+       // gọi từ mục 7.1 (MEET) luôn truyền Meet, mục 7.2 (HEADWAY) luôn truyền Headway, mục 7.3
+       // (OVERTAKE) luôn truyền Overtake — `RequiredShiftCalculator` biết reason vì nó biết
+       // đang tính công thức nào (7.1/7.2/7.3), không cần suy luận thêm.
    ```
 
 2. **Operational waiting mutation** — hệ quả từ ràng buộc headway với tàu kia, chèn đúng tại ga S,
@@ -895,7 +1316,7 @@ RequiredShiftResult
     DecelerationPenaltyMinutes: int    // 0 nếu !IsForcedStop
     AccelerationPenaltyMinutes: int    // 0 nếu !IsForcedStop
     RequiredWaitingMinutes: int        // = ExtraWait(W,S), tính SAU khi áp structural (nếu có)
-    TotalAdditionalTimeMinutes: int    // = Decel + Accel + RequiredWaiting — dùng cho điều kiện 6, mục 7.3
+    TotalAdditionalTimeMinutes: int    // = Decel + Accel + RequiredWaiting — dùng cho điều kiện 6, mục 7.4
     ViolatedConstraint: string?
 }
 ```
@@ -905,19 +1326,57 @@ RequiredShiftResult
 
 ### 7.1 MEET tại ga S, tàu chờ = W, tàu đi qua = P
 
+> **Viết lại (2026-08-23, review lần 5):** bản trước dùng `Arrival(P, S)` mà không nói rõ (a) `P` là ai —
+> phải tự suy diễn từ đâu, (b) đọc `Arrival` tại **instance** nào (`CycleIndex` nào) của `P`. Cả 2 điểm
+> nay có API tường minh, không tự suy diễn/tra lại mơ hồ:
+>
+> ```text
+> S  := candidate.TrainToWaitLocalStationIndex     // local index cua W tai candidate (muc 6.0, da resolve)
+> P  := conflict.OtherServiceId(candidate.TrainToWait)         // muc 1.7 - method moi, KHONG tu so sanh A/B
+> Sp := candidate.OtherTrainLocalStationIndex!.Value           // local index cua P tai CUNG candidate station
+>                                                                // (muc 6.0, da resolve luc generate - throw
+>                                                                // neu null, vi MEET LUON co gia tri nay)
+> waitingCycleIndex := conflict.CycleIndexOf(candidate.TrainToWait)   // instance cua W (muc 1.7)
+> otherCycleIndex   := conflict.CycleIndexOf(P)                       // instance cua P (muc 1.7)
+> ```
+>
+> `Conflict` tham chiếu một **cặp instance cụ thể** (mục 6.3) — `Arrival(P, S)` PHẢI đọc đúng
+> `otherCycleIndex`, không phải luôn luôn instance chu kỳ 0 của `P`, nếu không hai tàu cách nhau đúng 1
+> chu kỳ (1440') sẽ bị tính sai lệch nguyên `1440` phút. Cần 2 hàm đọc thời điểm tại MỘT LOCAL INDEX (khác
+> `SectionTimingResolver.GetEntryTime/GetExitTime`, vốn đọc tại **ranh giới 1 Section**, mục 6.3) — mở
+> rộng cùng lớp `SectionTimingResolver` với 2 hàm mới, cùng nguyên tắc "không tự suy luận, chỉ đọc":
+>
+> ```text
+> SectionTimingResolver.GetArrivalAtLocalIndex(trajectory, localIndex, cycleIndex): int
+>     = trajectory.Entries[localIndex].ArrivalTimeMinutes!.Value + cycleIndex * CycleLengthMinutes
+> SectionTimingResolver.GetDepartureAtLocalIndex(trajectory, localIndex, cycleIndex): int
+>     = trajectory.Entries[localIndex].DepartureTimeMinutes!.Value + cycleIndex * CycleLengthMinutes
+> ```
+
 ```text
-ForcedStop(W, S) = (S không thuộc StopRequirements của W)   // true nếu W vốn chạy thông qua S
+ForcedStop(W, S) = (trajectory cua W tai local index S co StopType == Through)   // ForcedStopMutator.IsForcedStop
+                    // (mục 7.0/7.2 — DÙNG LẠI nguyên hàm đã có, không viết lại cho MEET)
 
-// Bước 1 (nếu ForcedStop): ApplyForcedStop(T, S) — xem mục 7.0 — rồi mới đọc Arrival(W,S) bên dưới.
+// Bước 1 (nếu ForcedStop): preview := ForcedStopMutator.Preview(W.Trajectory, S, ForcedStopReason.Meet,
+// runningTimeRules) — DÙNG LẠI Y NGUYÊN co che da implement/test cho HEADWAY (mục 7.2), chi khac
+// ForcedStopReason -> StopType(S) sau khi commit se la ForcedMeet, khong phai ForcedHeadway. Neu khong
+// ForcedStop: preview := W.Trajectory (khong doi).
 
-EarliestSafeDeparture(W, S) = Arrival(P, S) + SectionReleaseHeadwayMinutes
+ArrivalOfP := SectionTimingResolver.GetArrivalAtLocalIndex(P.Trajectory, Sp, otherCycleIndex)
+
+EarliestSafeDeparture(W, S) = ArrivalOfP + Conflict.RequiredHeadwayMinutes
                              // = ĐÚNG rule Section Release Headway (mục 5.2/5.6): Arrival(P,S) chính là
                              // ExitTime của P khỏi khu gian dẫn vào S; W muốn đi khu gian đó theo chiều
-                             // ngược lại (departure từ S) phải cách đủ SectionReleaseHeadwayMinutes.
-                             // Đổi tên từ "MeetHeadway" (bản nháp trước) — cùng một hằng số, chỉ đổi tên
-                             // cho khớp mục 5.6 sau khi xác nhận đây là Section Release Headway dùng
-                             // chung, không phải một loại headway riêng cho MEET.
-NaturalDeparture(W, S)      = Arrival(W,S, SAU structural nếu có) + StopTime(W,S,tự nhiên hoặc 0 nếu qua thông)
+                             // ngược lại (departure từ S) phải cách đủ SectionReleaseHeadwayMinutes. DÙNG
+                             // TRỰC TIẾP Conflict.RequiredHeadwayMinutes (đã cố định lúc detect, mục 5.6/
+                             // 1.7) — KHÔNG đọc lại IHeadwayRules.SectionReleaseHeadwayMinutes tươi, tránh
+                             // lệch nếu config đổi giữa lúc detect và lúc resolve (cùng nguyên tắc đã áp
+                             // dụng cho HEADWAY, mục 7.2 — dùng field đã lưu trên Conflict, không đọc lại
+                             // config sống).
+
+NaturalDeparture(W, S) = SectionTimingResolver.GetDepartureAtLocalIndex(preview, S, waitingCycleIndex)
+                             // đọc trên PREVIEW (sau structural nếu có) — giống hệt cách HEADWAY đọc
+                             // PreviewFollowerEntry (mục 7.2), StopTime tự nhiên đã nằm sẵn trong Departure
 
 ExtraWait(W, S) = MAX(0, EarliestSafeDeparture(W,S) - NaturalDeparture(W,S))
 
@@ -928,17 +1387,169 @@ TotalAdditionalTimeMinutes(W) =
   + [ ForcedStop(W,S) ?  AccelerationPenalty + DecelerationPenalty  : 0 ]
 ```
 
+**Feasibility** (giống hệt pattern đã dùng cho HEADWAY, mục 7.2): `IsFeasible = TotalAdditionalTimeMinutes
+<= BufferCalculator.ComputeForwardSlackMinutes(W.Service, W.Trajectory GỐC, StationSequence tại S)` — tính
+trên trajectory GỐC (không phải preview) và **không cần** `CycleIndex` (ForwardSlack là khái niệm thuần
+`TrainService`, mục 4.1/0.1 — quyết định luôn ghi vào `TrainService`, không phụ thuộc instance nào kích
+hoạt conflict).
+
 Lưu ý chiều: nếu `P` đến trước và `W` vốn phải chờ P thì trên — đây là case điển hình khi W đang đỗ sẵn
 tại S chờ đi tiếp. Nếu ngược lại (W đã ở trong section muốn tới S nhưng P đến S trước và cần W dừng hẳn
 lại thay vì chạy tiếp), công thức đối xứng: ràng buộc trở thành trên cạnh vào S của W — cùng một pattern,
-chỉ đổi biến nào là "đến trước/đi sau". `RequiredShiftCalculator` implement như 1 phép so khớp cặp
-(Arrival/Departure) theo đúng quan hệ trong mục 6, tổng quát hoá cho cả 2 hướng thứ tự trước–sau.
+chỉ đổi biến nào là "đến trước/đi sau". `RequiredShiftCalculator.ComputeMeet` nhận `CandidateSolution`
+làm tham số chính (thay vì các primitive rời rạc) — `TrainToWait`/`TrainToWaitLocalStationIndex`/
+`OtherTrainLocalStationIndex` đã đủ để tự suy ra `P`/`Sp` qua `conflict.OtherServiceId(...)`, không cần
+biết trước "ai đến trước/ai đến sau" ở tầng gọi; công thức tự đối xứng đúng cho cả 2 hướng vì `W`/`P` chỉ
+là tên gọi theo góc nhìn của candidate đang xét (mục 6.1 đã sinh 2 `CandidateSolution` độc lập, mỗi cái
+tự có góc nhìn `TrainToWait`/`OtherTrain` riêng — không có khái niệm "A luôn đến trước" ở tầng này).
 
-### 7.2 OVERTAKE tại ga S, tàu chậm = Slow (chờ), tàu nhanh = Fast (vượt)
+> **Cạnh biên ĐÃ chốt (2026-08-23, review lần 6):** nếu `Sp` (local index của P tại candidate station)
+> chính là **ga xuất phát của P** (`ArrivalTimeMinutes` tại đó = `null`), `ComputeMeet` **KHÔNG BAO GIỜ**
+> nhận được candidate như vậy nữa — quyết định là **(1)**: loại bỏ ngay từ `GenerateMeetCandidates` (mục
+> 6.1, bước 5), không phải xử lý/fallback ở `ComputeMeet`. Lý do: `Departure(P,Sp)` **không mang cùng ý
+> nghĩa vật lý** với `Arrival(P,Sp)` trong công thức này — `Arrival(P,S)` cụ thể là "thời điểm P *giải
+> phóng* khu gian dẫn vào S", còn nếu P xuất phát tại S thì không hề có sự kiện giải phóng khu gian nào để
+> neo mốc đó; falling back sang `Departure` sẽ âm thầm đổi ý nghĩa công thức mà không ai biết. Việc "2 tàu
+> cùng khởi hành tại 1 ga theo thứ tự cấp khu gian" (nếu cần) là một **constraint khác, dựa trên
+> departure/resource-release riêng** — không nhét vào MEET-arrival rule hiện tại (ngoài phạm vi hiện tại).
+>
+> Vì filter đã chạy ở mục 6.1 (áp dụng đúng theo TỪNG HƯỚNG, không loại cả physical station — phương án
+> đối xứng "P chờ, W đi qua" vẫn có thể hợp lệ nếu `W` có `Arrival` tại `S`), `ComputeMeet` **được phép
+> tin tưởng hoàn toàn** invariant này: đọc thẳng `ArrivalTimeMinutes!.Value`/`DepartureTimeMinutes!.Value`
+> (non-null assertion, cùng phong cách code đã dùng trong `TrajectoryPropagator`/`SectionOccupationBuilder`)
+> mà **không cần thêm kiểm tra `null` phòng thủ nào** — nếu invariant bị vi phạm do lỗi ở tầng generate,
+> đây phải là một `NullReferenceException` fail-fast, không phải một giá trị `null` được lặng lẽ dung nạp.
+
+**Test bắt buộc** (dùng khi viết `RequiredShiftCalculatorTests` cho `ComputeMeet` — đối xứng A-waits/
+B-waits là trọng tâm, vì đây chính là điểm review lần 5 nhắm tới):
+
+| # | Kịch bản | Kỳ vọng |
+|---|----------|---------|
+| M1 | `CandidateSolution{TrainToWait=ServiceIdA}` — A chờ B tại S; B đã đến S lúc t=100, headway=3, A tự nhiên khởi hành lúc t=95 (ForcedStop=false) | `EarliestSafeDeparture=103`, `NaturalDeparture=95`, `RequiredWaitingMinutes=8` |
+| M2 | Y HỆT dữ liệu vật lý như M1 nhưng đổi vai: `CandidateSolution{TrainToWait=ServiceIdB}` — B chờ A, dùng `Arrival(A,S)`/`CycleIndexOf(A)` qua `conflict.OtherServiceId(ServiceIdB)` | Phải tính ra kết quả **độc lập, không copy logic M1** — xác nhận code không hard-code "A luôn là bên chờ" hoặc "A luôn là Other" |
+| M3 | Giống M1 nhưng `A`/`B` khác `CycleIndexA`/`CycleIndexB` (vd `CycleIndexA=0`, `CycleIndexB=1`, lệch nguyên 1440') | `Arrival(P,S)` phải cộng đúng `CycleIndexOf(P) × 1440` — nếu code lỡ luôn dùng `CycleIndex=0` cho P, kết quả sẽ sai lệch đúng 1440' (test phải bắt được sai lệch cỡ lớn này, không chỉ sai lệch vài phút) |
+| M4 | Candidate S đang là `Through` (`ForcedStop=true`), structural (decel+accel) đã đủ tự giải quyết deficit | `RequiredWaitingMinutes` phải phản ánh đúng phần **preview** (giống pattern H1/H4 của HEADWAY, mục 7.2) — không cộng thẳng deficit gốc |
+| M5 | `TotalAdditionalTimeMinutes` vượt quá `ForwardSlack(W, S)` | `IsFeasible=false`, `ViolatedConstraint` khác `null` |
+| M6 | `S` là ga xuất phát của P / ga đến của W | **Không áp dụng ở đây** — trường hợp này đã bị loại triệt để tại `GenerateMeetCandidates` (mục 6.1 bước 5, test 14–16 ở mục 6.4); `ComputeMeet` chỉ cần tin tưởng invariant, không cần test riêng cho case này |
+
+### 7.2 HEADWAY tại ga S, tàu chờ (Follower) = W, tàu dẫn (Leader) = P
+
+> Chỉ áp dụng cho `TrainToWait=W` khi `W` là **Follower** (`conflict.FollowerServiceId`, mục 1.7) —
+> `CandidateGenerator` (mục 6.1, nhánh HEADWAY) đã đảm bảo **không bao giờ** sinh `CandidateSolution`
+> cho Leader trong HEADWAY, nên `RequiredShiftCalculator` ở đây không cần tự kiểm tra lại vai trò
+> Leader/Follower — nhưng NẾU cần đọc, phải dùng `conflict.FollowerServiceId`/`conflict.LeaderServiceId`
+> (mục 1.7), không tự suy diễn qua `ServiceIdA`/`ServiceIdB`.
+
+`S` là candidate station **thượng nguồn** của đầu-vào (`EntrySection`) của chính Section đang xung đột
+trên route của W (mục 6.1) — **không nhất thiết là chính ga xảy ra xung đột**, khác với MEET/OVERTAKE
+(mục 7.1/7.3) vốn luôn tính tại đúng ga `S` nơi 2 tàu "gặp nhau". Vì vậy công thức HEADWAY phải **lan
+truyền** hiệu ứng chờ tại `S` tới đúng `EntrySection`, dùng lại nguyên vẹn cơ chế hấp thụ đã chứng minh ở
+`TrajectoryPropagator.InsertDelay` (mục 8).
+
+> **Sửa lại (2026-08-23, review lần 3 — điểm 1):** công thức trước (`RequiredWaiting = HeadwayDeficit +
+> TotalRecoveryBetween`, tính trên trajectory GỐC) **sai** khi candidate `S` đồng thời là một `ForcedStop`
+> — bước 1 (`ApplyForcedStop`, mục 7.0) tự nó ĐÃ làm Follower đến `EntrySection` muộn hơn (nhờ
+> `DecelerationPenalty`/`AccelerationPenalty` lan truyền), tức là **tự giải quyết một phần hoặc toàn bộ
+> deficit** trước khi bất kỳ waiting nào được cộng thêm — công thức cũ cộng thẳng `HeadwayDeficitMinutes`
+> gốc là bỏ qua hoàn toàn đóng góp này, dẫn đến `RequiredWaitingMinutes` bị tính THỪA. Phải tính trên một
+> bản **preview** đã áp `ApplyForcedStop` (nếu có) rồi mới đo phần deficit CÒN LẠI.
+
+```text
+ForcedStop(W, S) = (S không thuộc StopRequirements của W)   // true nếu W vốn chạy thông qua S
+
+// Buoc 1 - PREVIEW, khong commit: neu ForcedStop, ap ApplyForcedStop (muc 7.0) len MOT BAN SAO cua
+// trajectory cua W - Calculator van pure/immutable, "preview" khong bao gio ghi de trajectory that:
+preview := ForcedStop(W,S) ? PreviewApplyForcedStop(W.Trajectory, S, ForcedStopReason.Headway) : W.Trajectory
+                          // PreviewApplyForcedStop = dung chinh logic ApplyForcedStop (muc 7.0) nhung tra
+                          // ve MOT BAN TRAJECTORY MOI, khong mutate W.Trajectory that - cung nguyen tac da
+                          // chot o muc 7.0 ("RequiredShiftCalculator chi tinh, khong mutate trajectory
+                          // that"); 7.1/7.3 von da ngam dinh dieu nay khi doc Arrival(W,S) "sau structural
+                          // neu co" - o day goi ten tuong minh la "preview" vi cong thuc can DOC LAI nhieu
+                          // dai luong tren cung 1 ban preview (khong chi 1 lan nhu MEET/OVERTAKE).
+
+LeaderExitTime := SectionTimingResolver.GetExitTime(
+                      LeaderService, LeaderTrajectory, LeaderNetwork,
+                      conflict.SectionId, conflict.LeaderCycleIndex)
+                          // sua diem 1 (review lan 4): DOC TRUC TIEP occupation time hien tai cua Leader
+                          // qua SectionTimingResolver (muc 6.3), KHONG derive tu Conflict.ConflictEndTime/
+                          // RequiredHeadway - cach cu tao coupling ngam vao dung 1 cong thuc noi bo cua
+                          // ConflictDetector.BuildConflict (muc 5.5) ma Domain KHONG guarantee o muc
+                          // Conflict record; neu cong thuc do doi, LeaderExitTime se am tham sai theo ma
+                          // khong co gi bao loi. RequiredShiftCalculator von da co san Leader's
+                          // service/trajectory/network (duoc truyen vao cung candidate), nen doc thang tu
+                          // nguon vat ly la dung dan hon.
+
+PreviewFollowerEntry := SectionTimingResolver.GetEntryTime(
+                      FollowerService, preview, FollowerNetwork,
+                      conflict.SectionId, conflict.FollowerCycleIndex)
+                          // dung CHINH preview (khong phai FollowerTrajectory that) - da phan anh dung
+                          // +DecelerationPenalty tai S va phan carry +AccelerationPenalty lan truyen tu
+                          // S+1 (muc 7.0) NEU ForcedStop; neu khong ForcedStop thi preview == trajectory
+                          // goc nen ket qua = gia tri goc. (OriginalFollowerEntry, neu can doi chieu/debug,
+                          // tinh tuong tu nhung truyen FollowerTrajectory GOC thay vi preview.)
+
+RequiredSafeEntry := LeaderExitTime + Conflict.RequiredHeadwayMinutes
+                          // Conflict.RequiredHeadwayMinutes van la field hop le de dung truc tiep (hang so
+                          // headway, khong phai du lieu vat ly suy dien) - CHI ConflictStartTime/
+                          // ConflictEndTime moi bi cam dung lam nguon du lieu vat ly o cong thuc nay.
+
+RemainingDeficit := max(0, RequiredSafeEntry - PreviewFollowerEntry)
+                          // phan deficit CON LAI SAU KHI structural (neu co) da tu dong dong gop - co the
+                          // la 0 neu structural mot minh da du giai quyet xung dot.
+
+RecoveryRemainingBetween := tong RecoveryTimeFromPrevMinutes CON LAI cua cac ga tren PREVIEW (khong phai
+                          // trajectory goc) cua W, nam SAU S va TRUOC/TAI EntrySection - PHAI do tren
+                          // preview vi chinh buoc ApplyForcedStop (neu co) co the da "an" bot mot phan
+                          // recovery nay khi lan truyen carry S+1 (muc 7.0/8) - do tren trajectory goc se
+                          // sai neu ForcedStop da tieu bot no.
+
+// Buoc 2 - waiting toi thieu can cay THEM vao preview (tai S) de RemainingDeficit duoc hap thu het:
+RequiredWaitingMinutes(W) :=
+    RemainingDeficit == 0
+        ? 0                                          // structural (neu co) da tu du - KHONG can cho them
+        : RemainingDeficit + RecoveryRemainingBetween // xem "Vi sao co dieu kien" duoi day
+
+TotalAdditionalTimeMinutes(W) =
+    RequiredWaitingMinutes(W)
+  + [ ForcedStop(W,S) ?  AccelerationPenalty + DecelerationPenalty  : 0 ]
+```
+
+**Vì sao phải có điều kiện `RemainingDeficit == 0 ? 0 : ...` (không phải cộng thẳng như bản review lần
+2)**: gọi `R := RecoveryRemainingBetween`, `D := RemainingDeficit`. Muốn `max(0, delta - R) >= D` với
+`delta` nhỏ nhất — nếu `D = 0` thì `delta = 0` đã thoả (không cần cấy thêm gì, kể cả khi `R > 0`); nếu
+`D > 0` thì bắt buộc `delta - R >= D` (vì `max(0,x) >= D > 0` chỉ đúng khi chính `x >= D`, không phải khi
+`x` âm), tức `delta >= D + R`. Bỏ điều kiện này (cộng thẳng `D + R` kể cả khi `D=0`) sẽ **cấy thừa** đúng
+bằng `R` phút waiting không cần thiết mỗi khi structural một mình đã đủ giải quyết xung đột — lãng phí
+`ForwardSlack` một cách không cần thiết (mục 7.4 điều kiện 6), có thể khiến một candidate vốn khả thi bị
+đánh giá sai thành infeasible.
+
+**Test bắt buộc** (đúng ví dụ điểm 1 review lần 3 — dùng khi viết `RequiredShiftCalculatorTests` cho
+nhánh HEADWAY):
+
+| # | Input (`HeadwayDeficitMinutes` gốc, đóng góp structural tại `EntrySection`, `RecoveryRemainingBetween`) | `RequiredWaitingMinutes` mong đợi | Vì sao |
+|---|---|---|---|
+| H1 | deficit=2, structural=3, recovery=0 | **0** (không phải 2) | `RemainingDeficit=max(0,2-3)=0` — structural một mình dư giải quyết |
+| H2 | deficit=5, structural=3, recovery=0 | **2** | `RemainingDeficit=max(0,5-3)=2`, `R=0` → structural chỉ đóng góp MỘT PHẦN |
+| H3 | deficit=5, structural=0 (không ForcedStop), recovery=4 | **9** | `RemainingDeficit=5`, `+R=4` → phải cấy dư 4' vì recovery giữa `S` và `EntrySection` "ăn" bớt |
+| H4 | deficit=2, structural=3, recovery=4 (có ForcedStop NHƯNG structural đã tự đủ) | **0** (không phải 4) | `RemainingDeficit=max(0,2-3)=0` → dù `R=4>0`, KHÔNG cấy thêm gì (chính là lý do cần điều kiện, không cộng thẳng `0+4`) |
+| H5 | Candidate `S` vốn là điểm dừng `Through` (không thuộc `StopRequirements` của Follower) — `ForcedStop(W,S)=true` | `IsForcedStop=true`; `StopType(S)` sau khi áp `ApplyForcedStop(T,S,ForcedStopReason.Headway)` (mục 7.0) phải là **`ForcedHeadway`** (không phải `ForcedMeet`/`ForcedOvertake`, sửa điểm 2 review lần 4); `DecelerationPenaltyMinutes`/`AccelerationPenaltyMinutes` vẫn đúng như MEET/OVERTAKE (logic accel/decel dùng chung, không duplicate theo `reason`) |
+
+**Kiểm chứng tổng quát**: nếu `RemainingDeficit > 0`, sau khi áp `InsertDelay(W, S, RequiredWaitingMinutes)`
+lên preview: `NewFollowerEntry - PreviewFollowerEntry = max(0, RequiredWaitingMinutes -
+RecoveryRemainingBetween) = RemainingDeficit` (theo đúng công thức `InsertDelay` mục 8), suy ra
+`NewFollowerEntry = PreviewFollowerEntry + RemainingDeficit = LeaderExitTime + RequiredHeadwayMinutes`
+đúng bằng ngưỡng tối thiểu. Nếu `RemainingDeficit = 0`, preview đã tự thoả mãn `>= LeaderExitTime +
+RequiredHeadwayMinutes`, không cần InsertDelay nào thêm.
+
+`RequiredShiftCalculator` **không tự mutate trajectory thật** ở đây cũng như mọi Type khác (mục 7.0) —
+`preview` chỉ tồn tại trong bộ nhớ tạm của phép tính, không commit; và **không tự kiểm tra lại**
+`TrainToWait` có đúng là Follower hay không (trách nhiệm đó thuộc `CandidateGenerator`, mục 6.1).
+
+### 7.3 OVERTAKE tại ga S, tàu chậm = Slow (chờ), tàu nhanh = Fast (vượt)
 
 ```text
 NaturalDeparture(Fast, S) = ... (không đổi, Fast không bị ảnh hưởng nếu S có đủ track vượt)
-// Bước 1 (nếu ForcedStop(Slow,S)): ApplyForcedStop(T, S) trước, rồi mới đọc NaturalDeparture(Slow,S).
+// Bước 1 (nếu ForcedStop(Slow,S)): ApplyForcedStop(T, S, ForcedStopReason.Overtake) trước, rồi mới đọc NaturalDeparture(Slow,S).
 EarliestSafeDeparture(Slow, S) = Departure(Fast, S) + OvertakeHeadway
 RequiredWaitingMinutes(Slow) = MAX(0, EarliestSafeDeparture(Slow,S) - NaturalDeparture(Slow,S))
 TotalAdditionalTimeMinutes(Slow) = RequiredWaitingMinutes(Slow) + [ForcedStop(Slow,S) ? Accel+Decel : 0]
@@ -947,7 +1558,7 @@ TotalAdditionalTimeMinutes(Slow) = RequiredWaitingMinutes(Slow) + [ForcedStop(Sl
 Điều kiện tiên quyết: `Arrival(Fast, S) < Departure(Slow, S) tự nhiên` (Fast phải đến kịp trước khi Slow
 định rời ga) — nếu không, ga này không giải quyết được overtake, loại khỏi candidate list.
 
-### 7.3 Kiểm tra tính hợp lệ sau khi có RequiredShift (bắt buộc, 7 điều kiện mục 12)
+### 7.4 Kiểm tra tính hợp lệ sau khi có RequiredShift (bắt buộc, 7 điều kiện mục 12)
 
 ```text
 1–2. Không còn overlap MEET / vi phạm headway tại chính section đang xét    → đảm bảo bởi công thức trên.
@@ -1032,14 +1643,16 @@ nhau, theo đúng thứ tự:
 2. InsertDelay(T, k=S, delta=RequiredWaitingMinutes)                        // neo tại S
 ```
 
-(Nếu conflict không phải MEET/OVERTAKE mà chỉ là delay vận hành thuần túy — vd tàu trễ do sự cố — thì
-chỉ có bước 2 chạy, với `S` = ga phát sinh delay; đây chính là use case gốc mà `TrajectoryPropagatorTests`
-đang kiểm chứng ở Phase 2.)
+(Nếu không có `ForcedStop` — S vốn đã là điểm dừng theo lịch, hoặc chỉ là delay vận hành thuần túy vd tàu
+trễ do sự cố — thì chỉ có bước 2 chạy, với `S` = ga phát sinh delay; đây chính là use case gốc mà
+`TrajectoryPropagatorTests` đang kiểm chứng ở Phase 2. Cả 3 loại conflict có thể sinh `ForcedStop` — MEET,
+HEADWAY (mục 7.2), OVERTAKE — đều dùng chung 2 bước này, chỉ khác `ForcedStopReason` truyền vào
+`ApplyForcedStop` mục 7.0 quyết định `StopType` nào được gán.)
 
-Vì `TotalAdditionalTimeMinutes` đã được kiểm tra `<= ForwardSlack` (mục 7.3, điều kiện 6) trước khi commit
+Vì `TotalAdditionalTimeMinutes` đã được kiểm tra `<= ForwardSlack` (mục 7.4, điều kiện 6) trước khi commit
 — tính trên **tổng** cả hai lần gọi — về mặt lý thuyết `delta` ở cả hai bước cộng lại sẽ luôn được hấp thụ
 hết trước khi chạm `FixedArrivalTime`, cho dù bước 1 (neo tại S+1) tiêu một phần recovery trước khi bước 2
-(neo tại S) chạy tới. Invariant này chính là điều `RequiredShiftCalculator` phải đảm bảo (mục 7.3, điều
+(neo tại S) chạy tới. Invariant này chính là điều `RequiredShiftCalculator` phải đảm bảo (mục 7.4, điều
 kiện 6), và Phase 2 `TrajectoryPropagator` tự nó **không cần biết** có đang xử lý ForcedStop hay không —
 đúng như đã chốt trong review Phase 2 (`TrajectoryPropagator` giữ đơn giản, không tự suy luận nghiệp vụ
 tránh/vượt).

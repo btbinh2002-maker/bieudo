@@ -10,5 +10,6 @@ public sealed record Station
 
     public bool CanMeet => Tracks.Count(t => t.UsableForMeet) >= 2;
     public bool CanOvertake => Tracks.Count(t => t.UsableForOvertake) >= 2;
+    public bool CanHold => Tracks.Count >= 1;
     public int MaxSimultaneousTrains => Tracks.Count;
 }
