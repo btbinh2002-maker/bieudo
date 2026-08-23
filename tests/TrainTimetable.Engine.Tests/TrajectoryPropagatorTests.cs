@@ -160,6 +160,115 @@ public class TrajectoryPropagatorTests
         Assert.True(newTrajectory.Last.ArrivalTimeMinutes <= service.FixedArrivalTimeMinutes);
     }
 
+    // Trajectory KHONG co recovery nao duoc cay san (RecoveryTimeFromPrev = 0 khap noi) - dung mo phong
+    // dung y "TotalBuffer chua phan bo" tren MinimumTimetableBuilder that (xem thiet ke muc 15.6/15.10).
+    // Ga1(origin,dep=0) -> Ga2(arr=50,dep=50) -> Ga3(arr=100,dep=100) -> Ga4(arr=160,dep=160)
+    //                   -> Ga5(dest,arr=210). MinimumJourneyTime=50+50+60+50=210, JourneyTime=230
+    //                   -> TotalBuffer=20.
+    private static (TrainService Service, TrainServiceTrajectory Trajectory) BuildZeroRecoveryScenarioWithTotalBufferTwenty()
+    {
+        var service = new TrainService(
+            serviceId: "SE2", trainCode: "SE2", direction: Direction.Inbound,
+            originStationSequence: 1, destinationStationSequence: 5,
+            fixedDepartureTimeOfDayMinutes: 0, journeyTimeMinutes: 230, priority: 1,
+            stopRequirements: new List<TrainStopRequirement>());
+
+        var entries = new List<TimetableEntry>
+        {
+            Entry(1, null, 0, running: 0, recovery: 0),
+            Entry(2, 50, 50, running: 50, recovery: 0),
+            Entry(3, 100, 100, running: 50, recovery: 0),
+            Entry(4, 160, 160, running: 60, recovery: 0),
+            Entry(5, 210, null, running: 50, recovery: 0)
+        };
+
+        var trajectory = new TrainServiceTrajectory { ServiceId = "SE2", Entries = entries };
+        return (service, trajectory);
+    }
+
+    [Fact]
+    public void InsertDelay_OnZeroRecoveryTrajectory_ConsumesUnallocatedBufferAcrossSequentialInsertsAndBlocksOverflow()
+    {
+        // Test bat buoc (yeu cau review): chung minh bang so lieu that, khong chi bang chung minh dai
+        // so, rang mot trajectory KHONG co recovery nao cay san van hap thu dung dan nhieu lan
+        // InsertDelay lien tiep, luon giu Arrival(destination) <= FixedArrivalTime, va UnallocatedBuffer
+        // (mucc 15.10, BufferCalculator.ComputeBufferState) giam dung theo tung lan chen - khong can
+        // BufferAllocator cay RecoveryTimeFromPrev truoc.
+        var (service, trajectory) = BuildZeroRecoveryScenarioWithTotalBufferTwenty();
+
+        var initialState = _bufferCalculator.ComputeBufferState(service, trajectory);
+        Assert.Equal(20, initialState.TotalBufferMinutes);
+        Assert.Equal(0, initialState.AllocatedRecoveryMinutes);
+        Assert.Equal(0, initialState.ConsumedBufferMinutes);
+        Assert.Equal(20, initialState.UnallocatedBufferMinutes);
+
+        // Chen 5 phut tai ga giua (Ga2) -> con lai 15.
+        var result1 = _propagator.InsertDelay(service, trajectory, stationSequence: 2, delayMinutes: 5);
+        Assert.True(result1.IsFeasible);
+        Assert.Equal(0, result1.ResidualDelayMinutes);
+        Assert.True(result1.NewTrajectory!.Last.ArrivalTimeMinutes <= service.FixedArrivalTimeMinutes);
+
+        var state1 = _bufferCalculator.ComputeBufferState(service, result1.NewTrajectory);
+        Assert.Equal(20, state1.TotalBufferMinutes); // hang so, khong doi qua InsertDelay
+        Assert.Equal(0, state1.AllocatedRecoveryMinutes); // khong co recovery nao de tieu
+        Assert.Equal(5, state1.ConsumedBufferMinutes);
+        Assert.Equal(15, state1.UnallocatedBufferMinutes);
+
+        // Chen them 12 phut (cong don 17) tai cung Ga2, tren trajectory MOI -> con lai 3.
+        var result2 = _propagator.InsertDelay(service, result1.NewTrajectory, stationSequence: 2, delayMinutes: 12);
+        Assert.True(result2.IsFeasible);
+        Assert.Equal(0, result2.ResidualDelayMinutes);
+        Assert.True(result2.NewTrajectory!.Last.ArrivalTimeMinutes <= service.FixedArrivalTimeMinutes);
+
+        var state2 = _bufferCalculator.ComputeBufferState(service, result2.NewTrajectory);
+        Assert.Equal(20, state2.TotalBufferMinutes);
+        Assert.Equal(0, state2.AllocatedRecoveryMinutes);
+        Assert.Equal(17, state2.ConsumedBufferMinutes);
+        Assert.Equal(3, state2.UnallocatedBufferMinutes);
+
+        // Chen them 4 phut nua (se vuot qua 3 phut con lai) -> PHAI infeasible, KHONG duoc coi la thanh
+        // cong roi lam Arrival(destination) tre qua FixedArrivalTime.
+        var result3 = _propagator.InsertDelay(service, result2.NewTrajectory, stationSequence: 2, delayMinutes: 4);
+        Assert.False(result3.IsFeasible);
+        Assert.Null(result3.NewTrajectory);
+        Assert.Equal(1, result3.ResidualDelayMinutes); // con lai 3, vuot 1 phut
+
+        // Trajectory tra ve tu lan chen truoc (result2) khong bi anh huong boi lan chen that bai - van
+        // dung hen dung gio.
+        Assert.Equal(service.FixedArrivalTimeMinutes, result2.NewTrajectory.Last.ArrivalTimeMinutes + 3);
+    }
+
+    [Theory]
+    [InlineData(2)]
+    [InlineData(3)]
+    [InlineData(4)]
+    public void BufferState_And_ForwardSlack_SatisfyRemainingBufferIdentity_AtVariousStations(int stationSequence)
+    {
+        // Chung minh identity muc 4.3 (RemainingBuffer = ForwardSlack(k) + RedistributableSlack(k)) tren
+        // chinh trajectory da co san recovery khong deu (station3 recovery=10) - dam bao AllocatedRecovery
+        // KHONG bi tinh nham thanh da tieu (RemainingBuffer phai tinh tu ConsumedBuffer, khong phai
+        // TotalBuffer - AllocatedRecovery - ConsumedBuffer).
+        var (service, trajectory) = BuildScenario();
+
+        var state = _bufferCalculator.ComputeBufferState(service, trajectory);
+        Assert.Equal(
+            state.TotalBufferMinutes,
+            state.AllocatedRecoveryMinutes + state.ConsumedBufferMinutes + state.UnallocatedBufferMinutes);
+
+        var remainingBuffer = state.TotalBufferMinutes - state.ConsumedBufferMinutes;
+        Assert.Equal(state.AllocatedRecoveryMinutes + state.UnallocatedBufferMinutes, remainingBuffer);
+
+        var forwardSlack = _bufferCalculator.ComputeForwardSlackMinutes(service, trajectory, stationSequence);
+
+        // RedistributableSlack(T,k): recovery cua moi ga m voi StationSequence(m) <= k - BAO GOM ca
+        // RecoveryTimeFromPrev(k) chinh no (khu gian dan VAO k), dung bien nhu mo ta o muc 4.2.
+        var redistributableSlack = trajectory.Entries
+            .Where(e => e.StationSequence <= stationSequence)
+            .Sum(e => e.RecoveryTimeFromPrevMinutes);
+
+        Assert.Equal(remainingBuffer, forwardSlack + redistributableSlack);
+    }
+
     [Fact]
     public void InsertDelay_AtOriginStation_ThrowsBecauseFixedDepartureTimeIsImmutable()
     {

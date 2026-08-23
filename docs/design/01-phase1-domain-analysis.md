@@ -108,7 +108,7 @@ Domain
 Configuration
  ├─ StopRules          (PassengerStop, TechnicalStop, CombineRule)
  ├─ RunningTimeRules   (AccelerationPenalty, DecelerationPenalty)
- ├─ HeadwayRules       (MeetHeadway, SameDirectionHeadway, OvertakeHeadway)
+ ├─ HeadwayRules       (SectionReleaseHeadwayMinutes — dùng chung MEET/HEADWAY, mục 5.6; OvertakeHeadway riêng)
  ├─ SolverParameters   (CandidateWindow, BeamWidth, LookAheadConflicts, CyclicRadius...)
  └─ CostWeights        (alpha..epsilon, objective weights)
 
@@ -281,21 +281,34 @@ thân hiện tượng chiếm dụng khu gian là một sự kiện vật lý t�
 Conflict
   ConflictId
   Type: enum { MEET, HEADWAY, OVERTAKE }
+  ConstraintKind: enum { SectionOverlap, SectionReleaseHeadway, OrderReversal }   // mục 5.2/5.4
   ServiceA, CycleIndexA
   ServiceB, CycleIndexB
   SectionId (hoặc dải Section liên tiếp cho OVERTAKE)
-  ConflictTimeWindow: (start, end)
+  ConflictStartTime, ConflictEndTime      // thay cho ConflictTimeWindow — cùng nội dung, tách 2 field
+                                           // cho dễ dùng trực tiếp trong so sánh/sort mà không destructure
+
+  RequiredHeadwayMinutes: int             // = SectionReleaseHeadwayMinutes tại thời điểm detect (mục 5.6)
+  ActualGapMinutes: int                   // = Later.EntryTime - Earlier.ExitTime, CÓ THỂ ÂM (mục 5.2)
+  HeadwayDeficitMinutes: int              // = max(0, RequiredHeadwayMinutes - ActualGapMinutes)
+
   Severity / Difficulty   // xem mục 12
 ```
+
+> **Sửa lại (2026-08-23, chốt trước Phase 3):** thêm `ConstraintKind` và 3 field số
+> (`RequiredHeadwayMinutes`/`ActualGapMinutes`/`HeadwayDeficitMinutes`) để `Conflict` tự mang đủ dữ liệu
+> phân biệt "vi phạm gap thuần tuý" khỏi "overlap vật lý thật" và "đảo thứ tự nhiều Section" — không cần
+> `RequiredShiftCalculator`/`CandidateEvaluator` tính lại từ đầu (mục 5.5 đã tính sẵn khi detect).
 
 Một `Conflict` luôn tham chiếu tới **cặp instance cụ thể** (`Service + CycleIndex` cho mỗi bên) vì đó là
 thứ va chạm nhau trên trục thời gian thực; nhưng khi resolve, quyết định sửa luôn ghi ngược lại
 `TrainService` (bỏ `CycleIndex`, quy đổi thời điểm xung đột về chu kỳ 0) — xem mục 0.1 hệ quả 2–3 và mục
 9.2.
 
-Thiết kế 3 loại conflict dùng **chung 1 hạ tầng phát hiện** (interval overlap trên occupation) nhưng khác
-điều kiện kích hoạt và khác Resolver — đúng yêu cầu "không xây kiến trúc chỉ dùng riêng cho MEET" (mục 14
-đề bài).
+Thiết kế 3 loại conflict dùng **chung 1 hạ tầng phát hiện** — điều kiện Section Release Headway trên
+occupation (mục 5.2), không phải "interval overlap" đơn thuần như bản nháp trước — nhưng khác điều kiện
+kích hoạt cụ thể (chiều + `OrderReversal` mục 5.3/5.4) và khác Resolver, đúng yêu cầu "không xây kiến
+trúc chỉ dùng riêng cho MEET" (mục 14 đề bài).
 
 ---
 
@@ -351,7 +364,8 @@ RunningTime(i → i+1, Train T)
 ```
 
 Toàn bộ 3 hằng số (`PassengerStop=3`, `TechnicalStop=20`, `AccelerationPenalty=2`,
-`DecelerationPenalty=1`, `MeetHeadway=3`) nằm trong `Configuration`, **không hard-code** trong Engine —
+`DecelerationPenalty=1`, `SectionReleaseHeadwayMinutes=3` — mục 5.6) nằm trong `Configuration`, **không
+hard-code** trong Engine —
 Engine chỉ nhận `IStopRules`, `IRunningTimeRules`, `IHeadwayRules` qua constructor/tham số.
 
 ---
@@ -362,12 +376,32 @@ Bản đầu tiên gộp "usable slack sau xung đột" thành một công thứ
 khác nhau về bản chất, vì chúng có nguồn gốc và điều kiện sử dụng khác nhau:
 
 ```text
-TotalBuffer(T)        = hằng số theo mục 3, cố định khi timetable đầu vào cố định.
-UsedBuffer(T)         = Σ RecoveryTimeFromPrev đã cấy dọc trajectory hiện tại + tổng WaitingTime
-                         phát sinh do resolve conflict.
-RemainingBuffer(T)    = TotalBuffer(T) - UsedBuffer(T)     // con số TOÀN CỤC — KHÔNG BAO GIỜ dùng
-                                                            //  trực tiếp để quyết định 1 conflict cụ thể.
+TotalBuffer(T)         = hằng số theo mục 3, cố định khi timetable đầu vào cố định (mục 15.10:
+                          bất biến qua mọi TrajectoryPropagator.InsertDelay, không chỉ tại t=0).
+AllocatedRecovery(T)   = Σ RecoveryTimeFromPrev CÒN LẠI dọc trajectory hiện tại — buffer đã được "đặt
+                          chỗ" vào một section cụ thể nhưng CHƯA bị tiêu, vẫn khả dụng nguyên vẹn.
+ConsumedBuffer(T)      = tổng phút buffer đã THỰC SỰ bị một quyết định delay/forced-stop/waiting sử
+                          dụng (= TimetableEntry.CumulativeInsertedDelayMinutes tại destination) —
+                          KHÔNG bao gồm AllocatedRecovery (recovery mới "đặt chỗ" nhưng chưa tiêu).
+UnallocatedBuffer(T)   = TotalBuffer(T) - AllocatedRecovery(T) - ConsumedBuffer(T)   // phần chưa hề
+                          được quyết định gán vào đâu cả — vẫn "tự do" hoàn toàn.
+
+RemainingBuffer(T)     = TotalBuffer(T) - ConsumedBuffer(T)
+                        = AllocatedRecovery(T) + UnallocatedBuffer(T)   // TƯƠNG ĐƯƠNG — chỉ trừ phần
+                          ĐÃ TIÊU, KHÔNG trừ phần đã đặt chỗ nhưng còn khả dụng. Con số TOÀN CỤC — KHÔNG
+                          BAO GIỜ dùng trực tiếp để quyết định 1 conflict cụ thể (mục 4.3).
 ```
+
+> **Sửa lại (2026-08-23, thống nhất với `BufferState`/`BufferCalculator.ComputeBufferState`, đã code &
+> test — `src/TrainTimetable.Engine/BufferCalculator.cs`):** bản nháp trước gộp nhầm
+> `RecoveryTimeFromPrev đã cấy` (= `AllocatedRecovery`, còn khả dụng) vào chung `UsedBuffer` với
+> `WaitingTime` (= `ConsumedBuffer`, đã tiêu thật) — hai đại lượng khác bản chất, không được cộng chung.
+> Ví dụ: `TotalBuffer=20, AllocatedRecovery=8` (đã cấy vào một section nhưng chưa ai đụng tới),
+> `ConsumedBuffer=0` (chưa quyết định delay nào tiêu tới nó) → `UnallocatedBuffer=12`, nhưng
+> `RemainingBuffer` vẫn phải là **20** (cả 8 phút đã cấy lẫn 12 phút chưa cấy đều còn "sống" — chỉ khi
+> một `InsertDelay` thực sự tiêu vào 8 phút đó thì nó mới chuyển thành `ConsumedBuffer` và
+> `RemainingBuffer` mới giảm). Nếu muốn giữ tên `UsedBuffer`, định nghĩa lại `UsedBuffer := ConsumedBuffer`
+> (không cộng `AllocatedRecovery`) — tài liệu từ đây dùng `ConsumedBuffer` làm tên chính thức.
 
 ### 4.1 ForwardSlack(T, k) — "usable slack sau xung đột", trần cứng, luôn an toàn để dùng ngay
 
@@ -377,13 +411,32 @@ ForwardSlack(T, k) = FixedArrivalTime(T)
                     - MinimumRemainingJourneyTime(T, k → destination)
 ```
 
-Đây là **maximum forward delay mà hành trình có thể hấp thụ TỪ ga k trở đi**, tính trên cơ sở
-"hiện đang rời k lúc nào, và phần còn lại nếu chạy đúng bằng tối thiểu (không dùng thêm recovery nào
-downstream) sẽ mất bao lâu". Nó **không** phụ thuộc buffer đã được phân bổ thế nào ở các ga sau k (vì
-`MinimumRemainingJourneyTime` là cận dưới tuyệt đối, không tính recovery đã hoạch định) — nói cách khác,
-`ForwardSlack(T,k)` **loại trừ đúng phần buffer "nằm ở tương lai xa" mà đề bài cảnh báo ở mục 8** (ví dụ:
-tàu còn 40 phút buffer nhưng 35 phút nằm sau xung đột hiện tại → không tự động coi 35 phút đó là dùng
-được cho xung đột này; `ForwardSlack` trả lời chính xác câu hỏi này bằng công thức trên).
+Đây là **maximum forward delay mà hành trình có thể hấp thụ TỪ ga k trở đi**: tổng lượng thời gian bổ
+sung tối đa có thể tiêu kể từ vị trí k trở đi mà tàu vẫn còn khả năng về đúng `FixedArrivalTime`, với giả
+định phần còn lại (từ k đến đích) chạy đúng bằng tối thiểu (không còn recovery nào để dùng thêm).
+
+> **Sửa lại (2026-08-23, review trước Phase 3):** bản nháp trước mô tả sai rằng công thức này "loại trừ
+> buffer nằm ở tương lai xa". **Sai** — `ForwardSlack(T,k)` **BAO GỒM toàn bộ** slack/recovery có thể
+> khai thác được ở phía sau k, **bất kể nằm gần hay xa** k (miễn còn nằm giữa k và đích): nếu tàu có 40
+> phút buffer và cả 40 phút đó đều nằm sau k, `ForwardSlack(T,k) = 40`, không phải một con số nhỏ hơn.
+> Thứ **duy nhất** `ForwardSlack(T,k)` loại trừ là phần slack/recovery đã nằm **TRƯỚC** k — tức
+> `RedistributableSlack(T,k)` (mục 4.2) — vì phần đó đã "chốt" vào `CurrentDeparture(T,k)` (đã cộng vào
+> thời điểm rời k), không thể tiêu thêm ở k mà không revalidate ngược. Cách nhớ đúng:
+> `ForwardSlack(T,k)` = "toàn bộ dư địa còn lại kể từ đúng thời điểm hiện tại đang đứng ở k", không phải
+> "chỉ phần dư địa nằm ngay sát k".
+
+Chứng minh công thức tương đương làm rõ đúng chỗ này (mục 15.10, `BufferCalculator.ComputeBufferState` —
+đã implement & test): gọi `TotalRecoveryAfterK` = tổng `RecoveryTimeFromPrev` của mọi ga SAU k trên
+trajectory hiện tại, và `UnallocatedBuffer` = phần `TotalBuffer` chưa hề được cấy thành recovery ở bất kỳ
+đâu (mục 15.10). Khai triển đại số từ định nghĩa `ForwardSlack` cho ra:
+
+```text
+ForwardSlack(T, k) = UnallocatedBuffer + TotalRecoveryAfterK
+```
+
+Đúng nghĩa đen: **toàn bộ** phần chưa phân bổ (nằm "ảo" ở cuối hành trình) **cộng với toàn bộ** recovery
+đã cấy sẵn ở BẤT KỲ ga nào sau k (gần hay xa k đều tính, vì `TotalRecoveryAfterK` là một tổng không phân
+biệt vị trí) — không có khái niệm "quá xa nên không tính".
 
 Vì tính an toàn (không phụ thuộc giả định về việc tái phân bổ ngược), **`RequiredShiftCalculator` mặc
 định chỉ được phép tiêu tới `ForwardSlack(T,k)`** cho một xung đột tại k — đây là con số dùng trong mọi
@@ -396,10 +449,16 @@ phải thu hẹp lại theo mốc cố định gần nhất phía sau k thay vì
 ### 4.2 RedistributableSlack(T, k) — buffer đã cấy Ở PHÍA TRƯỚC k, có thể "mượn" nhưng phải re-validate
 
 ```text
-RedistributableSlack(T, k) = Σ RecoveryTimeFromPrev(m)  với mọi ga m nằm TRƯỚC k trên trajectory hiện tại
+RedistributableSlack(T, k) = Σ RecoveryTimeFromPrev(m)  với mọi ga m mà StationSequence(m) <= k
+                              // LƯU Ý biên: bao gồm CẢ RecoveryTimeFromPrev(k) chính nó — tức recovery
+                              // của khu gian dẫn VÀO k. ForwardSlack(T,k) (mục 4.1) chỉ cộng recovery
+                              // của các ga SAU k (StationSequence(m) > k, đúng vòng lặp trong
+                              // BufferCalculator.ComputeForwardSlackMinutes bắt đầu từ index+1) - nên
+                              // biên đúng để 2 con số cộng lại vừa khít AllocatedRecovery (không thiếu,
+                              // không đè) phải là "<= k" ở đây, không phải "< k".
 ```
 
-Đây là phần recovery-time **đã hoạch định** ở các khu gian trước k. Về nguyên tắc có thể loại bỏ (không
+Đây là phần recovery-time **đã hoạch định** ở các khu gian trước k (tính cả khu gian dẫn vào k). Về nguyên tắc có thể loại bỏ (không
 cấy recovery ở đó nữa) để tàu đến các ga trước k — và do đó đến cả k — **sớm hơn**, gián tiếp "tạo thêm"
 `ForwardSlack(T,k)` (vì `ForwardSlack` giảm khi `CurrentDeparture(T,k)` giảm, theo công thức 4.1 dấu trừ
 đứng trước nó nghĩa là làm nó tăng). **Đây không phải "tiền free"**: rút recovery ở ga m khiến tàu đến các
@@ -422,20 +481,58 @@ UsableSlackAtConflict(T, k) = ForwardSlack(T, k)                                
 
 Tóm lại: **"tàu còn nhiều `RemainingBuffer` không đồng nghĩa toàn bộ có thể dùng cho xung đột hiện tại"**
 — con số đúng để so sánh với `RequiredShift` luôn là `ForwardSlack(T,k)` (an toàn, cục bộ, tính được ngay
-từ trạng thái hiện tại), không phải `RemainingBuffer(T)` (toàn cục, có thể chứa phần "kẹt" ở tương lai
-theo đúng nghĩa slack sau điểm k khác) hay phần "kẹt" ở quá khứ trước k (chỉ dùng được qua cơ chế
-reallocation có kiểm chứng riêng, không mặc định).
+từ trạng thái hiện tại), không phải `RemainingBuffer(T)` (toàn cục). Quan hệ chính xác giữa hai con số
+(hệ quả trực tiếp của công thức mục 4.1 vừa chứng minh):
 
-`BufferAllocator` (Engine, Phase 2 khởi tạo + Phase 8 tối ưu) chịu trách nhiệm: (a) tạo phân bổ
-recovery-time ban đầu hợp lý dọc hành trình khi build minimum/free-running timetable (vd. rải đều, hoặc
-ưu tiên rải trước các ga hay xảy ra giao cắt — dùng lịch sử/heuristic), và (b) thực hiện
-`SlackReallocationStrategy` (mục 4.2) sau khi đã có nghiệm khả thi, để cải thiện độ đều của recovery
+```text
+RemainingBuffer(T) = ForwardSlack(T, k) + RedistributableSlack(T, k)      // đúng với MỌI k
+```
+
+Suy trực tiếp từ định nghĩa (không phải trùng hợp): `RedistributableSlack(T,k) = RecoveryAtOrBeforeK`
+(mục 4.2 — **bao gồm cả** `RecoveryTimeFromPrev(k)`, tức mọi ga `m` với `StationSequence(m) <= k`, đúng
+biên đã chốt ở mục 4.2) và `ForwardSlack(T,k) = UnallocatedBuffer + RecoveryAfterK` (mục 4.1, mọi ga
+`StationSequence(m) > k`). Vì mọi recovery trên trajectory đều nằm ở đúng một trong hai vùng này (không
+chồng lấp, không thiếu chỗ nào — biên `<= k` / `> k` chia trajectory làm đúng 2 phần):
+`RecoveryAtOrBeforeK + RecoveryAfterK = AllocatedRecovery` (tổng toàn trajectory, đầu mục 4). Do đó:
+
+```text
+ForwardSlack(T,k) + RedistributableSlack(T,k)
+    = UnallocatedBuffer + RecoveryAfterK + RecoveryAtOrBeforeK
+    = UnallocatedBuffer + AllocatedRecovery
+    = RemainingBuffer(T)                                    // đúng theo định nghĩa đầu mục 4
+```
+
+`ForwardSlack(T,k)` = phần dùng được ngay, không cần revalidate (mọi slack từ k trở đi, gần hay xa như
+đã sửa ở mục 4.1). `RedistributableSlack(T,k)` = phần đã "kẹt" trước k, chỉ dùng được qua cơ chế
+reallocation có kiểm chứng riêng (mục 4.2), không mặc định. Không có phần thứ ba nào khác — không tồn
+tại khái niệm buffer "sau k nhưng vẫn không tính vào `ForwardSlack`".
+
+`BufferAllocator` (Engine) chịu trách nhiệm: (a) tạo phân bổ recovery-time ban đầu hợp lý dọc hành trình
+(vd. rải đều, hoặc ưu tiên rải trước các ga hay xảy ra giao cắt — dùng lịch sử/heuristic), và (b) thực
+hiện `SlackReallocationStrategy` (mục 4.2) sau khi đã có nghiệm khả thi, để cải thiện độ đều của recovery
 (Objective 6, mục 20) hoặc để "giải cứu" một nhánh beam search suýt infeasible vì thiếu `ForwardSlack`
 cục bộ.
+
+> **Làm rõ (sau Phase 2 + Phase 2.5, mục 15.10):** cả (a) và (b) đều thuộc **Phase 8**, không phải
+> "Phase 2 khởi tạo" như phát biểu ở bản nháp đầu. `MinimumTimetableBuilder` đã implement (Phase 2, đã
+> commit) chỉ tạo trajectory tối thiểu với `RecoveryTimeFromPrevMinutes = 0` khắp nơi — đây **là** trạng
+> thái khởi tạo đúng (vì dữ liệu hành trình thật không cho biết buffer nằm ở đâu — mục 15.6), không phải
+> giá trị tạm chờ (a) chạy tiếp. (a)/(b) là cải tiến chất lượng, không phải điều kiện cần cho tính đúng
+> đắn — xem lập luận đầy đủ ở mục 15.10.
 
 ---
 
 ## 5. Section Occupation & Conflict Detection (mục 10, 14 — câu hỏi 5,6,7)
+
+> **Sửa lại (2026-08-23, chốt trước khi code Phase 3):** bản nháp trước tách MEET (ngược chiều, chỉ xét
+> overlap khoảng thời gian) và HEADWAY (cùng chiều, chỉ xét "giãn cách entry-entry hoặc exit-exit, tuỳ
+> cấu hình") như hai rule có **bản chất khác nhau**. Sai theo đúng nghiệp vụ thực tế: quy tắc gốc là
+> **"Section Release Headway"** — sau khi một tàu ra khỏi khu gian, phải chờ tối thiểu 3 phút thì tàu
+> tiếp theo (BẤT KỂ cùng chiều hay ngược chiều) mới được phép vào khu gian đó. MEET và HEADWAY dùng
+> **chung một điều kiện gap** (`Later.EntryTime − Earlier.ExitTime >= SectionReleaseHeadwayMinutes`),
+> chỉ khác nhau ở: MEET còn phải xét thêm khả năng **overlap vật lý thật sự** (hai tàu ngược chiều tranh
+> chấp khoảng thời gian), còn HEADWAY (cùng chiều) không có khả năng "overlap kiểu MEET" nhưng CÓ khả
+> năng suy biến thành OVERTAKE nếu gap âm đủ sâu (mục 5.4). Toàn bộ mục 5 viết lại theo đúng quy tắc này.
 
 ### 5.1 Section occupation
 
@@ -446,41 +543,197 @@ của `TrainServiceTrajectory` (dịch `+CycleIndex×1440`) sinh
 `ConflictDetector` **luôn chạy ở "chế độ cyclic"** ngay từ Phase 3 — không có một phiên bản "chỉ trong
 ngày" tách riêng rồi mở rộng sau; xem mục 11 để biết cách giới hạn `K` sao cho vẫn hiệu quả.
 
-### 5.2 Phát hiện MEET (ngược chiều)
-
-Với mỗi Section, gom occupation của tất cả instance (mọi service × mọi CycleIndex trong cửa sổ); sort
-theo `EntryTime`; sweep tuyến tính. Hai occupation
-`A` (Inbound) và `B` (Outbound) trên cùng Section (mà `NumberOfTracks == 1`) xung đột MEET nếu:
+### 5.2 Section Release Headway — điều kiện hợp lệ dùng chung cho MỌI cặp occupation cùng Section
 
 ```text
-overlap(A, B) := max(A.EntryTime, B.EntryTime) < min(A.ExitTime, B.ExitTime)
+SectionReleaseHeadwayMinutes = 3     // HeadwayRules.SectionReleaseHeadwayMinutes, mục 5.6 — ÁP DỤNG
+                                      // GIỐNG HỆT cho cả cặp cùng chiều lẫn ngược chiều trên cùng Section
 ```
 
-Độ phức tạp: O(n log n) mỗi section (n = số occupation), tổng O(N log N) toàn tuyến — đủ nhanh cho vài
-trăm tàu/ngày × 177 khu gian.
+Cho hai occupation `A`, `B` bất kỳ trên cùng `Section` (không phân biệt chiều), gọi `Earlier` = occupation
+có `EntryTime` nhỏ hơn, `Later` = occupation còn lại:
 
-### 5.3 Phát hiện HEADWAY (cùng chiều, chỉ cần giãn cách)
+```text
+ActualGapMinutes = Later.EntryTime − Earlier.ExitTime
 
-Hai occupation cùng chiều trên cùng Section vi phạm nếu khoảng cách entry-entry (hoặc exit-exit, tuỳ rule
-cấu hình — xem `HeadwayRules.SameDirectionHeadway`) nhỏ hơn ngưỡng, **nhưng vẫn giữ được thứ tự trước–sau
-không đổi trong suốt Section** (tàu sau không "chạm" tàu trước ở điểm nào bên trong section, chỉ là chưa
-đủ giãn cách tuyệt đối).
+ActualGapMinutes >= SectionReleaseHeadwayMinutes   → HỢP LỆ, không phải Conflict
+ActualGapMinutes <  SectionReleaseHeadwayMinutes   → Conflict (loại cụ thể xem mục 5.3/5.4)
+```
 
-### 5.4 Phát hiện OVERTAKE (cùng chiều, đảo thứ tự)
+`ActualGapMinutes` **có thể âm** — nghĩa là hai occupation thực sự chồng lấp thời gian trên cùng Section
+(`Later.EntryTime < Earlier.ExitTime`), không chỉ "chưa đủ giãn cách". Cả hai trường hợp (gap dương nhưng
+thiếu, và gap âm/overlap thật) đều đi qua **cùng một phép so sánh** — không có nhánh riêng cho
+"entry-entry" hay "exit-exit" như bản nháp trước.
 
-Khác HEADWAY: OVERTAKE là khi tàu B (đi sau, thường ưu tiên cao hơn hoặc nhanh hơn) sẽ **đuổi kịp và cần
-vượt lên trước** tàu A trong dải section chung. Thuật toán: đi dọc các ga chung của A, B theo chiều di
+**Biên quan trọng — `ActualGapMinutes == 0` VẪN LÀ conflict:** `A.ExitTime == B.EntryTime` không phải
+overlap khoảng thời gian theo nghĩa toán học (`[A.Entry,A.Exit)` và `[B.Entry,B.Exit)` không giao nhau),
+nhưng vẫn thiếu đủ 3 phút release headway → vẫn phải là `Conflict`. Đây là lý do quy tắc mục 5 **không
+được** viết lại thành `overlap(A,B) := max(...) < min(...)` như bản nháp trước — điều kiện đó bỏ sót đúng
+case biên này.
+
+`ConstraintKind` (mục 1.7) suy ra trực tiếp từ dấu của `ActualGapMinutes`:
+
+```text
+ActualGapMinutes < 0   → ConstraintKind = SectionOverlap        // hai occupation THỰC SỰ chồng lấp
+0 <= ActualGapMinutes < SectionReleaseHeadwayMinutes
+                        → ConstraintKind = SectionReleaseHeadway // không chồng lấp, chỉ thiếu headway
+ActualGapMinutes >= SectionReleaseHeadwayMinutes
+                        → không tạo Conflict
+```
+
+```text
+HeadwayDeficitMinutes = max(0, SectionReleaseHeadwayMinutes − ActualGapMinutes)
+```
+
+Với `ActualGapMinutes` âm (overlap thật), `HeadwayDeficitMinutes` tự động > `SectionReleaseHeadwayMinutes`
+(vd. overlap sâu 2 phút → deficit = 3 − (−2) = 5) — không cần công thức riêng cho case overlap.
+
+### 5.3 Phân loại theo chiều — MEET (ngược chiều) vs HEADWAY (cùng chiều)
+
+`ConstraintKind` và `Type` được suy **độc lập với nhau** từ hai thứ khác nhau — `ConstraintKind` chỉ phụ
+thuộc dấu của `ActualGapMinutes` (mục 5.2), `Type` chỉ phụ thuộc chiều của `A`/`B`. Không có quy tắc nào
+gán cứng "`SectionOverlap` chỉ xảy ra với `MEET`" — cùng chiều **vẫn có thể** `ActualGapMinutes < 0` (tàu
+sau vào Section trước khi tàu trước ra hẳn, chồng lấp vật lý thật trên cùng khu gian dù cùng chiều), và
+khi đó vẫn là `Type=HEADWAY` (vì cùng chiều), chỉ có `ConstraintKind=SectionOverlap` (vì gap âm):
+
+```text
+if ActualGapMinutes >= SectionReleaseHeadwayMinutes:
+    không tạo Conflict
+else:
+    ConstraintKind = (ActualGapMinutes < 0) ? SectionOverlap : SectionReleaseHeadway
+    Type           = (A.Direction != B.Direction) ? MEET : HEADWAY
+```
+
+Ví dụ (đã sửa sau review, khác bản nháp trước — bản trước lầm tưởng "HEADWAY cùng chiều không có khả
+năng overlap kiểu MEET", **sai**):
+
+```text
+Cùng chiều, ActualGap = -2   → Type=HEADWAY, ConstraintKind=SectionOverlap, HeadwayDeficit = 3-(-2) = 5
+Cùng chiều, ActualGap =  0   → Type=HEADWAY, ConstraintKind=SectionReleaseHeadway
+Cùng chiều, ActualGap =  2   → Type=HEADWAY, ConstraintKind=SectionReleaseHeadway
+```
+
+**Ngoại lệ double-track (chưa có track assignment ở Phase 3):** rule ở trên chỉ áp dụng đầy đủ khi
+`Section.NumberOfTracks == 1`. Khi `Section.NumberOfTracks >= 2`, **không** báo `MEET` chỉ vì hai
+occupation ngược chiều trùng/gần thời gian — vì rất có thể chúng dùng hai track vật lý độc lập, và
+Phase 3 hiện tại **chưa có track assignment** để biết chắc. HEADWAY (cùng chiều) **vẫn áp dụng như
+thường** kể cả khi `NumberOfTracks >= 2` (không có ngoại lệ ở đây, vì mặc định thận trọng: vẫn có khả
+năng hai tàu cùng chiều dùng chung track). Kiến trúc để ngỏ: khi có track assignment thật, rule sẽ áp
+theo đúng track/resource mà occupation sử dụng thay vì mù theo toàn `Section` — không đổi công thức gap
+ở mục 5.2, chỉ đổi phạm vi "occupation nào được so với occupation nào" (theo track thay vì theo Section).
+
+### 5.4 OVERTAKE (cùng chiều, thứ tự bị đảo qua nhiều ga/khu gian)
+
+`HEADWAY` (mục 5.3) đã bắt được mọi vi phạm gap tại **một** Section — kể cả trường hợp gap âm sâu (tàu
+sau vào Section trước khi tàu trước ra hẳn). Điều `HEADWAY` chưa nói được: liệu chỉ cần tàu sau **chờ
+thêm** tại ga trước Section này là đủ giải quyết (đây vẫn là `HEADWAY` thuần), hay tốc độ nội tại của hai
+tàu khiến vi phạm **lặp lại/nặng thêm ở các Section kế tiếp** dù có chờ thêm bao nhiêu — trường hợp sau
+chỉ giải được bằng cách cho tàu nhanh **vượt hẳn** tại một ga có năng lực vượt, không phải chờ đơn thuần.
+
+Thuật toán (không đổi so với bản nháp trước, vẫn đúng logic): đi dọc các ga chung của A, B theo chiều di
 chuyển; theo dõi "ai đang ở phía trước theo thời gian" tại mỗi ga; nếu tại ga `p` train A đang trước
-(`Arrival(A,p) < Arrival(B,p)`), nhưng tại ga `q > p` thứ tự đảo ngược
-(`Arrival(B,q) + margin <= Arrival(A,q)` hoặc occupation của B trên section trước q chồng lấp/đứng ngay
-sau occupation của A với khoảng cách âm) → đây là điểm cần OVERTAKE, đánh dấu dải section `[p, q]` là
-vùng xung đột loại OVERTAKE. Về bản chất, OVERTAKE = một dạng đặc biệt/nghiêm trọng của HEADWAY (khi
-giãn cách âm chứ không chỉ thiếu hụt), nên `ConflictAnalyzer` sẽ **luôn kiểm tra HEADWAY trước**, và nếu
-mức vi phạm đủ lớn để chỉ giải bằng chờ tại chỗ là không đủ (phá vỡ hard constraint no-crossing) thì phân
-loại lại thành `OVERTAKE`.
+(`Arrival(A,p) < Arrival(B,p)`) nhưng tại ga `q > p` thứ tự đảo ngược liên tục qua nhiều Section kế tiếp
+(không chỉ 1 Section như `HEADWAY` đơn lẻ) → đây là vùng cần `OVERTAKE`, đánh dấu dải Section `[p, q]` là
+vùng xung đột loại này, với `ConstraintKind = OrderReversal`.
 
-Cả 3 loại dùng chung interface `IConflictRule.Detect(occupations) -> List<Conflict>` để `ConflictDetector`
-chạy nhiều rule song song trên cùng dữ liệu occupation, đúng yêu cầu kiến trúc mở ở mục 14.
+`ConflictAnalyzer` (Phase 6) **luôn tạo `HEADWAY` trước** (mục 5.3, tại đúng Section phát hiện gap thiếu),
+rồi mới xét tiếp các Section kế cận cùng cặp A/B để xác nhận có phải `OrderReversal` kéo dài không; nếu
+có, phân loại lại `Type = OVERTAKE` (thay cho chuỗi `HEADWAY` liên tiếp) trước khi đưa vào
+`CandidateGenerator` — tránh sinh hàng loạt candidate "chờ tại ga" vô nghĩa cho một vấn đề chỉ giải được
+bằng vượt.
+
+Cả `MEET`, `HEADWAY`, `OVERTAKE` dùng chung interface `IConflictRule.Detect(occupations) -> List<Conflict>`
+để `ConflictDetector` chạy nhiều rule song song trên cùng dữ liệu occupation, đúng yêu cầu kiến trúc mở ở
+mục 14. Độ phức tạp: O(n log n) mỗi section (n = số occupation, sort theo `EntryTime` rồi sweep các cặp kề
+nhau — không cần so mọi cặp `O(n²)`, vì occupation không "chèn" giữa hai occupation liền kề mà không vi
+phạm gap với ít nhất một trong hai), tổng O(N log N) toàn tuyến.
+
+### 5.5 Thuật toán tổng hợp (`ConflictDetector`, mỗi `Section` độc lập)
+
+```text
+foreach Section S:
+    occupations := tất cả SectionOccupation trên S (mọi service × mọi CycleIndex trong cửa sổ, mục 5.1)
+    sort occupations theo EntryTime
+    foreach cặp (Earlier, Later) KỀ NHAU theo EntryTime (và các cặp gần kề khác có thể còn vi phạm — xem
+                                                          ghi chú độ phức tạp mục 5.4):
+        if S.NumberOfTracks >= 2 and Earlier.Direction != Later.Direction:
+            continue                                    // ngoại lệ double-track, mục 5.3
+
+        ActualGapMinutes := Later.EntryTime - Earlier.ExitTime
+        if ActualGapMinutes >= SectionReleaseHeadwayMinutes:
+            continue                                    // hợp lệ
+
+        ConstraintKind := ActualGapMinutes < 0 ? SectionOverlap : SectionReleaseHeadway
+        HeadwayDeficitMinutes := SectionReleaseHeadwayMinutes - ActualGapMinutes
+        Type := (Earlier.Direction != Later.Direction) ? MEET : HEADWAY
+        emit Conflict { Type, ConstraintKind, SectionId=S, ActualGapMinutes, HeadwayDeficitMinutes,
+                         RequiredHeadwayMinutes=SectionReleaseHeadwayMinutes, ... (mục 1.7) }
+
+// Bước riêng, SAU khi đã có toàn bộ Conflict HEADWAY (mục 5.4):
+foreach cặp (A, B) cùng chiều có ít nhất 1 Conflict HEADWAY chung:
+    kiểm tra OrderReversal qua các Section kế tiếp — nếu xác nhận, gộp/phân loại lại thành OVERTAKE
+```
+
+### 5.6 `HeadwayRules` (Configuration) — hợp nhất theo quy tắc Section Release Headway
+
+```text
+IHeadwayRules
+  SectionReleaseHeadwayMinutes: int = 3   // DÙNG CHUNG cho MEET (ngược chiều) và HEADWAY (cùng chiều),
+                                           // đúng nghiệp vụ mục 5.2 — KHÔNG tách MeetHeadway/
+                                           // SameDirectionHeadway thành 2 số khác nhau nữa.
+  OvertakeHeadway: int                    // GIỮ RIÊNG — dùng ở mục 7.2 (RequiredShiftCalculator,
+                                           // khoảng cách departure sau khi vượt tại ga), khác ngữ cảnh
+                                           // với Section Release Headway (đang xét khu gian, không phải
+                                           // thời điểm khởi hành sau khi overtake). CHƯA rà soát lại
+                                           // công thức mục 7.2 trong lượt sửa này — để dành khi code
+                                           // RequiredShiftCalculator thật (Phase 3 resolver), tránh lấn
+                                           // phạm vi ngoài yêu cầu hiện tại (chỉ ConflictDetector).
+```
+
+Đã giải quyết câu hỏi mở #3 ở mục 14.2 (*"`SameDirectionHeadway` mặc định — có thể tạm dùng chung giá trị
+với `MeetHeadway`, nhưng nên xác nhận"*): xác nhận xong — không phải "tạm dùng chung", mà **là cùng một
+khái niệm** (`SectionReleaseHeadwayMinutes`) theo đúng nghiệp vụ, không có 2 hằng số riêng để có thể lệch
+nhau trong tương lai.
+
+### 5.7 Bộ test bắt buộc cho `ConflictDetector` (spec — chưa có code, dùng khi viết `ConflictDetectorTests` ở Phase 3)
+
+Toàn bộ scenario dưới đây dùng `SectionReleaseHeadwayMinutes = 3` (mục 5.6), 1 `Section` duy nhất trừ khi
+ghi chú khác, đơn vị phút tuyệt đối (mục 2).
+
+**Ngược chiều (MEET):**
+
+| # | ExitA | EntryB | ActualGap | Kết quả |
+|---|-------|--------|-----------|---------|
+| 1 | 100 | 103 | 3 | Không tạo `Conflict` (hợp lệ, đúng ngưỡng) |
+| 2 | 100 | 102 | 2 | `MEET` / `ConstraintKind=SectionReleaseHeadway`, `HeadwayDeficitMinutes=1` |
+| 3 | 100 | 100 | 0 | `MEET` / `ConstraintKind=SectionReleaseHeadway`, `HeadwayDeficitMinutes=3` (biên — KHÔNG phải overlap toán học, vẫn là Conflict, xem mục 5.2) |
+| 4 | occupation A/B chồng lấp khoảng thời gian thật (`ActualGap<0`, vd `EntryB=98 < ExitA=100`) | — | `<0` | `MEET` / `ConstraintKind=SectionOverlap`, `HeadwayDeficitMinutes = 3 + |ActualGap|` |
+
+**Cùng chiều (HEADWAY):**
+
+| # | ExitA | EntryB | ActualGap | Kết quả |
+|---|-------|--------|-----------|---------|
+| 5 | 100 | 103 | 3 | Không tạo `Conflict` |
+| 6 | 100 | 102 | 2 | `HEADWAY` / `ConstraintKind=SectionReleaseHeadway` |
+| 7 | 100 | 100 | 0 | `HEADWAY` / `ConstraintKind=SectionReleaseHeadway` (biên, giống case 3 nhưng `Type` khác vì cùng chiều) |
+| 7b | occupation A/B **cùng chiều** chồng lấp khoảng thời gian thật (`ActualGap<0`, vd `EntryB=98 < ExitA=100`, `ActualGap=-2`) | — | `<0` | `HEADWAY` / `ConstraintKind=SectionOverlap`, `HeadwayDeficitMinutes=5` — **quan trọng**: `SectionOverlap` KHÔNG chỉ xảy ra với `MEET` (đã sửa sau review, xem mục 5.3) |
+
+**Cyclic (xuyên biên chu kỳ, mục 11):**
+
+| # | Kịch bản | Kết quả |
+|---|----------|---------|
+| 8 | `A` (CycleIndex=0) có `ExitTime=1439`; `B` (CycleIndex=+1) có `EntryTime` tại chu kỳ 0 là `1` → tuyệt đối `= 1 + 1×1440 = 1441` → `ActualGap = 1441-1439 = 2` | Phải detect `Conflict` (MEET hoặc HEADWAY tuỳ chiều) — đúng thuật toán mục 11.3 (occupations sinh cho mọi `CycleIndex ∈ [-K,K]` TRƯỚC khi sweep, không xử lý biên chu kỳ như một case riêng) |
+
+**Double-track (mục 5.3 ngoại lệ):**
+
+| # | Kịch bản | Kết quả |
+|---|----------|---------|
+| 9 | `Section.NumberOfTracks = 2`, hai occupation ngược chiều có `ActualGap < 0` (overlap nếu coi là single-track) | KHÔNG tạo `MEET` (bỏ qua cặp ngược chiều khi `NumberOfTracks >= 2`, mục 5.3) |
+| 10 | `Section.NumberOfTracks = 2`, hai occupation **cùng chiều** có `ActualGap < 3` | VẪN tạo `HEADWAY` như bình thường (không có ngoại lệ double-track cho cùng chiều, mục 5.3) |
+
+Case 1–7 ánh xạ trực tiếp từ ví dụ bạn đưa khi yêu cầu sửa rule này; case 7b bổ sung sau review thứ 2
+(cùng chiều vẫn có thể `SectionOverlap`, mục 5.3); case 8–10 bổ sung để khép kín với mục 11 (cyclic) và
+ngoại lệ double-track (mục 5.3) đã có sẵn trong thiết kế nhưng chưa từng có test đi kèm.
 
 ---
 
@@ -589,7 +842,13 @@ ForcedStop(W, S) = (S không thuộc StopRequirements của W)   // true nếu W
 
 // Bước 1 (nếu ForcedStop): ApplyForcedStop(T, S) — xem mục 7.0 — rồi mới đọc Arrival(W,S) bên dưới.
 
-EarliestSafeDeparture(W, S) = Arrival(P, S) + MeetHeadway     // theo đúng công thức mục 6 đề bài
+EarliestSafeDeparture(W, S) = Arrival(P, S) + SectionReleaseHeadwayMinutes
+                             // = ĐÚNG rule Section Release Headway (mục 5.2/5.6): Arrival(P,S) chính là
+                             // ExitTime của P khỏi khu gian dẫn vào S; W muốn đi khu gian đó theo chiều
+                             // ngược lại (departure từ S) phải cách đủ SectionReleaseHeadwayMinutes.
+                             // Đổi tên từ "MeetHeadway" (bản nháp trước) — cùng một hằng số, chỉ đổi tên
+                             // cho khớp mục 5.6 sau khi xác nhận đây là Section Release Headway dùng
+                             // chung, không phải một loại headway riêng cho MEET.
 NaturalDeparture(W, S)      = Arrival(W,S, SAU structural nếu có) + StopTime(W,S,tự nhiên hoặc 0 nếu qua thông)
 
 ExtraWait(W, S) = MAX(0, EarliestSafeDeparture(W,S) - NaturalDeparture(W,S))
@@ -1037,6 +1296,7 @@ Bổ sung thêm (phát sinh từ phân tích ở trên, nên có thêm trước 
 | 14 | Reallocate buffer sau khi có nghiệm khả thi (Phase 8) | `SlackReallocationStrategy` (mục 4.2) cải thiện phân bố recovery, có re-validate, không phá vỡ nghiệm đã đúng |
 | 15 | Resolve 1 conflict giữa `Instance(A,0)` và `Instance(B,1)` | Quyết định phải ghi vào `TrainService B` (chu kỳ 0) — sau khi apply, `Instance(B,0)` và `Instance(B,1)` đều dịch đúng cùng lượng, không được sửa lệch nhau (mục 0.1 hệ quả 2) |
 | 16 | Resolve xong 1 conflict làm dịch `TrainService W`, việc dịch chuyển đó lại tạo xung đột mới giữa `Instance(W, d+1)` (trước đó vô hại) và 1 service thứ 3 | `RecalculateAffected` phải quét lại TOÀN BỘ `CycleIndex ∈ [-K,K]` của `W`, không chỉ cặp instance ban đầu (mục 0.1 hệ quả 3, mục 9.2) |
+| 17 | Bộ 10 scenario Section Release Headway (mục 5.7): cùng/ngược chiều × gap {3,2,0,overlap}, cyclic, double-track | `ConflictDetector` áp đúng MỘT rule gap chung cho cả MEET/HEADWAY (mục 5.2), đặc biệt biên `ActualGap==0` vẫn là `Conflict` — sai sót dễ mắc nhất nếu lầm tưởng đây là bài toán "interval overlap" thuần túy |
 
 ---
 
@@ -1051,8 +1311,9 @@ Bổ sung thêm (phát sinh từ phân tích ở trên, nên có thêm trước 
   code hoặc test fixture); chưa tích hợp SQL Server — việc đọc dữ liệu từ DB thật là một
   `IRepository`/mapping layer làm sau, không ảnh hưởng `Domain`/`Engine`.
 - Toàn bộ hằng số nghiệp vụ (`PassengerStop`, `TechnicalStop`, `AccelerationPenalty`,
-  `DecelerationPenalty`, `MeetHeadway`, `OvertakeHeadway`, `SameDirectionHeadway`, `CandidateWindow`,
-  `BeamWidth`, `LookAheadConflicts`, các trọng số cost `α..ε`) nằm trong `Configuration`, truyền vào
+  `DecelerationPenalty`, `SectionReleaseHeadwayMinutes` — mục 5.6, dùng chung MEET/HEADWAY,
+  `OvertakeHeadway`, `CandidateWindow`, `BeamWidth`, `LookAheadConflicts`, các trọng số cost `α..ε`) nằm
+  trong `Configuration`, truyền vào
   `Engine` qua interface (`IStopRules`, `IRunningTimeRules`, `IHeadwayRules`, `SolverParameters`,
   `CostWeights`) — không hard-code ở bất kỳ đâu trong `Engine`.
 - Có thể dùng **immutable record** cho `Domain` (Station, Section, TrainService, TimetableEntry...) và mô
@@ -1066,11 +1327,442 @@ Bổ sung thêm (phát sinh từ phân tích ở trên, nên có thêm trước 
    liệu thật sau?
 2. **Dữ liệu năng lực tránh/vượt từng ga** (`StationTrack`) — đã có, hay tạm thời giả định `CanMeet=true`
    cho tất cả ga và bổ sung sau?
-3. **`SameDirectionHeadway` mặc định** — đề bài chỉ cho `MeetHeadway=3` và ngụ ý `OvertakeHeadway`, nhưng
-   chưa có giá trị mặc định cho giãn cách cùng chiều thuần tuý (không overtake). Cần một con số khởi điểm
-   (có thể tạm dùng chung giá trị với `MeetHeadway`, nhưng nên xác nhận).
+3. ~~**`SameDirectionHeadway` mặc định**~~ — **ĐÃ CHỐT** (2026-08-23, trước khi code Phase 3, mục 5.2/5.6):
+   không phải một hằng số riêng "tạm dùng chung" — đúng nghiệp vụ, giãn cách cùng chiều và ngược chiều
+   trên cùng Section **là cùng một quy tắc** (Section Release Headway = 3 phút, tính từ
+   `Later.EntryTime − Earlier.ExitTime`), gộp thành `HeadwayRules.SectionReleaseHeadwayMinutes` duy
+   nhất — không còn 2 hằng số `MeetHeadway`/`SameDirectionHeadway` tách biệt nữa.
 
-Đề xuất: mock dữ liệu ga/khu gian tối thiểu cho Phase 2–7 (đủ để chạy 16 unit test ở mục 13), tạm đặt
-`SameDirectionHeadway = MeetHeadway` làm giá trị khởi điểm có thể đổi qua config, và bắt đầu code Phase 2
+Đề xuất: mock dữ liệu ga/khu gian tối thiểu cho Phase 2–7 (đủ để chạy 16 unit test ở mục 13), dùng
+`SectionReleaseHeadwayMinutes = 3` (mục 5.6) làm giá trị mặc định duy nhất cho cả MEET và HEADWAY, và bắt
+đầu code Phase 2
 (solution `.sln` + project `Domain`, `Engine`, `Configuration`, và `*.Tests` bằng xUnit) ngay khi được xác
 nhận.
+
+---
+
+## 15. Phase 2.5 — Import dữ liệu hành trình thực tế vào Domain (mapping layer)
+
+Trả lời câu hỏi mở "nguồn dữ liệu" ở mục 14.1: **không dùng bảng `SectionRunningTime` riêng trong
+database** — map trực tiếp từ bảng "hành trình" hiện có (mỗi dòng = 1 ga trong hành trình của 1 tàu) sang
+`Domain` (mục 1). Đây là một **mapping layer** thuần túy (giống ghi chú ở mục 14.1: *"đọc dữ liệu từ DB
+thật là một `IRepository`/mapping layer làm sau, không ảnh hưởng `Domain`/`Engine`"*), không phải bảng
+DB mới, không phải logic solver.
+
+> **Sửa lại (2026-08-23, sau khi xác nhận đúng cấu trúc dữ liệu thật):** bản nháp đầu của mục này giả
+> định sai rằng Arrival/Departure tại các ga TRUNG GIAN là input có sẵn trong raw data, và từ đó định
+> tái tạo "existing scheduled slack/recovery" bằng cách so sánh raw schedule với minimum trajectory. Cả
+> hai giả định đó đều **sai** và đã bị loại bỏ hoàn toàn khỏi mục 15. Đúng ra: **input cố định theo thời
+> gian chỉ có ở đúng 2 điểm** (giờ đi ga xuất phát, giờ+ngày đến ga cuối) — Arrival/Departure ở MỌI ga
+> trung gian là **OUTPUT** do `MinimumTimetableBuilder` (và sau này solver) tính ra, không phải đọc từ
+> DB. Toàn bộ mục 15 dưới đây viết lại theo đúng mô hình input/output này.
+
+### 15.1 Raw input row — `TimetableSourceRow` (đã sửa: khớp đúng schema SQL thật)
+
+> **Sửa lại (2026-08-23, đã xác nhận schema SQL thật):** bản nháp trước tự đặt tên cột
+> (`FixedDepartureTimeOfDayMinutes`, `FixedArrivalTimeOfDayMinutes`) và giả định `StationCode: string`,
+> đồng thời mô tả sai rằng các cột Arrival/Departure "không tồn tại" trên dòng trung gian. Thực tế:
+> bảng chỉ có **một schema cột duy nhất** dùng chung cho mọi dòng (kể cả dòng trung gian) —
+> `ArrivalTime`/`ArrivalDayNumber`/`DepartureTime`/`DepartureDayNumber` **là cột có thật trong DB ở MỌI
+> dòng**, chỉ khác nhau ở **vai trò dùng cột đó** tuỳ vị trí dòng. Bảng dưới đây map lại đúng tên cột SQL
+> (không tự đặt tên khác) và ghi rõ vai trò từng cột theo vị trí dòng.
+
+Schema SQL thật:
+
+```text
+TrainCode                        varchar(50)
+JourneySequence                  int
+StationCode                      int              -- SỐ, không phải chuỗi
+ArrivalTime                      time(7)          -- time-of-day, có phần thập phân giây (không dùng)
+ArrivalDayNumber                 int
+DepartureTime                    time(7)
+DepartureDayNumber               int
+MinimumRunningTimeToNextStation  int
+PassengerStopMinutes             int
+TechnicalStopMinutes             int
+```
+
+`TimetableSourceRow` (kiểu CLR map 1:1 theo cột, dùng `TimeSpan?` cho `time(7)` — SQL `time(7)` là
+time-of-day thuần túy, KHÔNG có phần "ngày", nên khi đọc phải cắt về phút nguyên:
+`TimeOfDayMinutes = (int)Math.Truncate(value.TotalMinutes)`, bỏ hẳn phần giây/dưới-giây; nếu dữ liệu thật
+có phần giây khác 0 thì đây là mất mát có chủ đích — domain chỉ làm việc ở độ phân giải phút, mục 2):
+
+```text
+TimetableSourceRow
+  TrainCode: string
+  JourneySequence: int              // 1..N — thứ tự ga trong hành trình CỦA CHÍNH tàu này
+  StationCode: int                  // KHÔNG phải string — số hiệu ga trong DB
+  ArrivalTime: TimeSpan?
+  ArrivalDayNumber: int?
+  DepartureTime: TimeSpan?
+  DepartureDayNumber: int?
+  MinimumRunningTimeToNextStation: int?  // NULL/0 ở dòng cuối (không có khu gian kế tiếp)
+  PassengerStopMinutes: int
+  TechnicalStopMinutes: int
+```
+
+**Vai trò 4 cột thời gian theo vị trí dòng — đây là điểm mấu chốt cần map đúng:**
+
+```text
+Dòng JourneySequence = 1  (ga xuất phát):
+    DepartureTime, DepartureDayNumber   → INPUT (đọc, dùng làm FixedDepartureTimeOfDayMinutes)
+    ArrivalTime, ArrivalDayNumber       → không có ý nghĩa nghiệp vụ (ga xuất phát không "đến"); ignore
+
+Dòng JourneySequence = N  (ga đích):
+    ArrivalTime, ArrivalDayNumber       → INPUT (đọc, dùng làm FixedArrivalAbsoluteMinutes)
+    DepartureTime, DepartureDayNumber   → không có ý nghĩa nghiệp vụ (ga đích không "đi tiếp"); ignore
+
+Dòng 1 < JourneySequence < N  (MỌI ga trung gian):
+    ArrivalTime, ArrivalDayNumber, DepartureTime, DepartureDayNumber
+        → CẢ 4 CỘT ĐỀU LÀ "IgnoredAsInput / SolverOutput", KHÔNG PHẢI "không tồn tại"
+        → cột CÓ THỂ có giá trị sẵn trong DB (vd. từ lần chạy solver trước, hoặc placeholder nhập tay),
+          nhưng adapter khi LOAD để đưa vào MinimumTimetableBuilder/solver PHẢI BỎ QUA hoàn toàn giá
+          trị hiện có ở 4 cột này tại các dòng trung gian — không đọc, không dùng để validate, không
+          suy luận gì từ chúng. Khi SAVE kết quả (mục 15.9), adapter PHẢI GHI ĐÈ (overwrite) 4 cột này
+          bằng giá trị solver vừa tính ra, bất kể giá trị cũ là gì.
+```
+
+**Validate bắt buộc:** `DepartureDayNumber` tại dòng `JourneySequence=1` phải **đúng bằng 0** (quy ước
+Day 0 = ngày xuất phát, đã xác nhận — mục 15.3) — nếu khác 0, đây là dữ liệu nguồn sai hoặc quy ước ngày
+không khớp giả định, phải báo lỗi định vị chính xác (`TrainCode`, giá trị thực tế), không tự "chuẩn hoá"
+âm thầm bằng cách trừ đi cho khớp.
+
+Vẫn giữ đúng như đã xác nhận trước đó: mỗi hành trình có dòng cho **mọi ga vật lý** dọc tuyến kể cả ga
+chạy thông, nên `MinimumRunningTimeToNextStation` của dòng `i` luôn ứng đúng **một** `Section` liền kề
+trong `RailwayNetwork` (không phải tổng gộp qua nhiều khu gian).
+
+### 15.2 Group & order
+
+- Group theo `TrainCode` — mỗi group = đúng **một** `TrainService` (canonical pattern, mục 0.1/1.4);
+  bảng hành trình hiện tại không có khái niệm "nhiều lượt chạy" riêng biệt cần phân biệt thêm.
+- Sắp dòng trong group theo `JourneySequence` tăng dần → `r[1..N]`. `OriginStation = r_1`,
+  `DestinationStation = r_N`.
+- Kiểm tra chất lượng dữ liệu bắt buộc: `JourneySequence` của một group phải là dãy liên tục `1..N`,
+  không thiếu/không lặp; `r_1.DepartureTime`/`r_1.DepartureDayNumber` phải có giá trị (`DepartureDayNumber
+  = 0`, xem mục 15.1); `r_N.ArrivalTime`/`r_N.ArrivalDayNumber` phải có giá trị — nếu vi phạm, loại
+  `TrainCode` đó khỏi import và báo lỗi định vị chính xác, không âm thầm suy đoán hay bỏ qua.
+
+### 15.3 Chuyển đổi Day/Time ⇄ absolute minutes (dùng cả hai chiều: đọc input và ghi output)
+
+> **Sửa lại (quy ước Day — đã xác nhận với DB thật):** DB dùng **zero-based day number** —
+> `DepartureDayNumber` tại ga xuất phát = **0** (Day 0 = ngày xuất phát, Day 1 = ngày kế tiếp, Day 2 =
+> ngày thứ ba, ...), **không phải** Day 1 như bản nháp trước. Quy ước này thực ra trùng khớp 100% với
+> quy ước **đã có sẵn** trong `Domain` từ mục 2 (dòng ~304: *"tuyệt đối so với mốc `Day0 00:00 = 0`"*) —
+> nên Phase 2.5 không cần một quy ước "nội bộ" riêng nữa, chỉ cần dùng **đúng** quy ước Day0 đã có.
+
+Chọn **mốc 0 tuyệt đối = 00:00 của Day 0** (ngày của `r_1`, ga xuất phát) — trùng khớp với cách
+`TrainService.FixedDepartureTimeOfDayMinutes`/`JourneyTimeMinutes` và toàn bộ
+`TimetableEntry.ArrivalTimeMinutes`/`DepartureTimeMinutes` hiện tại (mục 1.4, 1.5, mục 2) đã biểu diễn
+thời gian: **số phút tuyệt đối kể từ đầu Day 0, không mod 1440** — nên **không cần thêm kiểu dữ liệu
+mới** trong `Domain`, chỉ cần đúng công thức chuyển đổi ở 2 biên (đọc input / ghi output).
+
+**Chiều vào (input → absolute minutes), chỉ dùng 2 dòng đầu/cuối — đọc đúng tên cột SQL (mục 15.1):**
+
+```text
+// Bước 0 (bắt buộc): validate r_1.DepartureDayNumber == 0 (mục 15.1) TRƯỚC khi tính gì —
+// nếu sai, dừng import cho TrainCode này, không tự "trừ bù" cho khớp.
+
+TimeOfDayMinutes(t: TimeSpan) = (int) Math.Truncate(t.TotalMinutes)   // cắt bỏ giây/dưới-giây (mục 15.1)
+
+FixedDepartureTimeOfDayMinutes  = TimeOfDayMinutes(r_1.DepartureTime)          // ∈ [0,1439]
+                                 // r_1.DepartureDayNumber đã validate = 0 nên không cần cộng vào
+FixedArrivalAbsoluteMinutes     = r_N.ArrivalDayNumber × 1440
+                                 + TimeOfDayMinutes(r_N.ArrivalTime)
+                                 // KHÔNG trừ 1 — Day 0 CHÍNH LÀ mốc gốc, không phải Day 1
+JourneyTimeMinutes              = FixedArrivalAbsoluteMinutes − FixedDepartureTimeOfDayMinutes
+                                 // KHÔNG modulo 1440 — đúng tinh thần mục 0 (hành trình có thể > 24h)
+```
+
+**Ví dụ số (đúng theo ví dụ đã xác nhận):**
+
+```text
+Departure 22:00 (= 22×60 = 1320 phút-trong-ngày), Day 0
+    → FixedDepartureTimeOfDayMinutes = 0 × 1440 + 1320 = 1320
+
+Arrival 05:00 (= 5×60 = 300 phút-trong-ngày), Day 2
+    → FixedArrivalAbsoluteMinutes    = 2 × 1440 + 300   = 3180
+
+JourneyTimeMinutes = 3180 − 1320 = 1860 phút
+```
+
+**Chiều ra (absolute minutes → Day/Time), dùng khi xuất output — mục 15.9:**
+
+```text
+DayNumber (quy ước Day 0)  = floor(AbsoluteMinutes ÷ 1440)
+TimeOfDayMinutes           = positiveModulo(AbsoluteMinutes, 1440)
+
+positiveModulo(x, m) = ((x mod m) + m) mod m     // ĐÚNG cho cả x âm — toán tử `%` trần trong C#
+                                                  // (và nhiều ngôn ngữ khác) trả về số dư ÂM khi x âm,
+                                                  // KHÔNG phải phép modulo toán học ở trên
+```
+
+Hai chiều này là nghịch đảo của nhau chính xác vì cùng dùng một mốc 0 (đầu Day 0) — không có sai số quy
+đổi tích lũy khi đi qua nhiều Section như một cách làm "cộng dồn Day rồi mod" theo từng bước dễ mắc lỗi.
+
+**Vì sao helper phải xử lý đúng cả số âm dù `TrainService` (chu kỳ 0) luôn có absolute time ≥ 0:**
+`FixedDepartureTimeOfDayMinutes ∈ [0, 1440)` (mục 1.4) nên canonical trajectory của Phase 2.5 không bao
+giờ sinh ra `AbsoluteMinutes` âm. Nhưng cùng helper `floor`/`positiveModulo` này rất có thể được tái
+dùng để hiển thị/ghi log cho `TrainInstance(ServiceId, CycleIndex)` (mục 1.4, 11) — vốn được suy ra bằng
+`Schedule(Service, Station, 0) + CycleIndex × 1440` với `CycleIndex` **có thể âm** (Day-1, Day-2... khi
+xét cửa sổ cyclic quanh nửa đêm, mục 11). Dùng `floor`/`positiveModulo` đúng chuẩn toán học ngay từ đầu
+tránh phải viết lại helper này khi Phase 3+ chạm tới `TrainInstance` âm chu kỳ.
+
+### 15.4 Mapping ra `TrainService`
+
+```text
+TrainService:
+    ServiceId                       = TrainCode        // 1 TrainCode ↔ 1 canonical pattern (hiện tại)
+    TrainCode                       = TrainCode
+    OriginStationSequence           = Sequence(r_1.StationCode)      // tra qua RailwayNetwork — mục 15.1
+    DestinationStationSequence      = Sequence(r_N.StationCode)      // (StationCode giờ là int, mục 15.1)
+    Direction                       = Inbound nếu OriginSeq < DestSeq, ngược lại Outbound
+    FixedDepartureTimeOfDayMinutes  = TimeOfDayMinutes(r_1.DepartureTime)     // mục 15.3
+    JourneyTimeMinutes              = FixedArrivalAbsoluteMinutes − FixedDepartureTimeOfDayMinutes  // mục 15.3
+    Priority                        = CHƯA có nguồn trong bảng hành trình — xem mục 15.11
+```
+
+`TrainService` (mục 1.4) chỉ cần đúng 2 đầu mút này — **không** cần, và **không được** đọc bất kỳ giá trị
+nào từ 4 cột Arrival/Departure ở các dòng trung gian, vì đó là `IgnoredAsInput / SolverOutput` (mục 15.1),
+không phải input đáng tin cậy.
+
+`Sequence(StationCode)` giả định có sẵn một lookup `Station` theo `StationCode` — gap thực tế của lookup
+này (chưa tồn tại trong `RailwayNetwork` đã commit) được ghi ở mục 15.11.
+
+### 15.5 Dwell time tại ga trung gian → `TrainStopRequirement` (KHÔNG có `ScheduledDwell` đầu vào)
+
+Với mỗi `r_i`, `1 < i < N` (bỏ qua `r_1`/`r_N` — ga xuất phát/đích đã LUÔN "dừng" theo đúng logic
+`willStop` hiện tại của `MinimumTimetableBuilder`, xem `MinimumTimetableBuilder.cs` dòng ~50, nên không
+cần khai `StopRequirement` riêng cho 2 ga này):
+
+```text
+RequiresPassengerStop = r_i.PassengerStopMinutes > 0
+RequiresTechnicalStop = r_i.TechnicalStopMinutes  > 0
+
+MandatoryStopDuration(r_i) =
+    !RequiresPassengerStop && !RequiresTechnicalStop  → 0                              // chạy thông
+    RequiresPassengerStop && RequiresTechnicalStop    → CombineMode(IStopRules) áp dụng
+                                                          TRÊN CHÍNH 2 giá trị của dòng này:
+                                                            Max → Max(r_i.PassengerStopMinutes,
+                                                                      r_i.TechnicalStopMinutes)
+                                                            Sum → r_i.PassengerStopMinutes
+                                                                  + r_i.TechnicalStopMinutes
+    chỉ 1 trong 2 đúng                                 → giá trị tương ứng của dòng này
+
+StopDurationOverrideMinutes(r_i) = MandatoryStopDuration(r_i)   // truyền vào TrainStopRequirement
+                                                                  làm override (mục 3.1, StopRules.cs)
+```
+
+**Khác với bản nháp trước:** `PassengerStopMinutes`/`TechnicalStopMinutes` của raw data **không phải**
+một "dwell thực tế đã quan sát được" để copy thẳng — đây là **mandatory minimum minutes theo từng loại
+tác nghiệp tại ga đó**, và phải đi qua đúng rule `CombineMode` (`Max`/`Sum`, cấu hình trong `IStopRules`,
+mục 3.1) để ra `MandatoryStopDuration` — chỉ khác `StopRules.ResolveStopMinutes` hiện tại ở chỗ 2 giá trị
+đưa vào combine là **của riêng dòng này** (do ga khác nhau có thể có mandatory minutes khác nhau), không
+phải 2 hằng số cấu hình toàn cục (`IStopRules.PassengerStopMinutes`/`TechnicalStopMinutes` — 2 hằng số
+đó giờ chỉ còn là **giá trị mặc định** dùng khi ga không có input cụ thể, ví dụ tàu mới thêm bằng tay).
+Việc combine 2 giá trị *tường minh* (khác 2 hằng số toàn cục) theo `CombineMode` chưa có sẵn trong
+`IStopRules` hiện tại (`ResolveStopMinutes` chỉ combine đúng 2 hằng số cố định của chính nó) — khi code
+Phase 2.5 thật, cần thêm 1 method nhỏ kiểu `CombineExplicitStopMinutes(passengerMinutes, technicalMinutes,
+combineMode)` để mapper và `StopRules` dùng chung logic Max/Sum, tránh lặp code (chưa code ở bước này).
+
+### 15.6 Dựng minimum trajectory & biểu diễn buffer CHƯA phân bổ
+
+```text
+MinimumJourneyTime = Σ MinimumRunningTimeToNextStation(mọi khu gian, sau khi validate/dedupe — mục 15.7)
+                    + Σ MandatoryStopDuration(mục 15.5)
+                    + Σ AccelerationPenalty + Σ DecelerationPenalty        // đúng công thức mục 3
+
+TotalBuffer = JourneyTimeMinutes (mục 15.3/15.4) − MinimumJourneyTime     // đúng BufferCalculator hiện có
+```
+
+Đây chính xác là những gì `MinimumTimetableBuilder` + `BufferCalculator` (Phase 2, **đã implement, không
+đổi gì**) đã làm — `MinimumTimetableBuilder` build trajectory với `RecoveryTimeFromPrevMinutes = 0` ở
+**mọi** entry (xem `MinimumTimetableBuilder.cs` dòng 101). Điều này giờ được xác nhận là **đúng mô
+hình**, không phải giá trị khởi tạo tạm thời chờ cấy: **database không cho biết buffer thực tế đang nằm
+ở đâu** (vì Arrival/Departure trung gian không phải input — mục 15.1), nên **không có cơ sở nào để suy
+luận một cách phân bổ recovery ban đầu khác 0**. Hệ quả biểu diễn trong `Domain`:
+
+- `TotalBuffer` (một số vô hướng, từ `BufferCalculator.Calculate`) là **quỹ chưa phân bổ**, không gắn với
+  bất kỳ `Section`/`TimetableEntry` cụ thể nào.
+- Trên trajectory tối thiểu, quỹ này biểu diễn **ngầm định** dưới dạng khoảng cách giữa
+  `MinimumTrajectory.Last.ArrivalTimeMinutes` và `TrainService.FixedArrivalTimeMinutes` — không có
+  trường nào trên `TimetableEntry` lưu trực tiếp con số "buffer còn lại tính tới đây"; muốn biết, luôn
+  phải hỏi `BufferCalculator.ComputeForwardSlackMinutes(service, trajectory, k)` (mục 4.1), không đọc
+  trực tiếp field nào.
+- `RecoveryTimeFromPrevMinutes = 0` khắp nơi trên trajectory tối thiểu là **baseline đúng và duy nhất**
+  suy ra được từ raw data — mọi cách "rải" khác (đều, theo heuristic, theo lịch sử xung đột...) đều là
+  một quyết định của `BufferAllocator` cần **thêm thông tin ngoài bảng hành trình** (xem mục 15.9), Phase
+  2.5 (mapping layer thuần túy) không tự ý làm việc đó.
+
+### 15.7 Validate & dedupe `MinimumRunningTimeToNextStation` → `Section` (yêu cầu chính, không đổi so với bản trước)
+
+Với mọi cặp liên tiếp `(r_i, r_{i+1})` của **mọi** `TrainCode`, gom thành 1 quan sát:
+
+```text
+(SectionKey = (min(FromSeq,ToSeq), max(FromSeq,ToSeq)), Direction, TrainCode, MinRunningTime)
+```
+
+rồi group theo `(SectionKey, Direction)`:
+
+```text
+foreach group in observations.GroupBy(SectionKey, Direction):
+    distinctValues := group.Select(MinRunningTime).Distinct()
+    if distinctValues.Count == 1:
+        # NHẤT QUÁN giữa mọi tàu cùng khu gian + cùng chiều → dedupe an toàn
+        Section.MinRunningTimeMinutes[Direction] := distinctValues.Single()
+    else:
+        # KHÔNG được ép thành 1 giá trị chung (yêu cầu tường minh) — xem mục 15.8
+        RecordNonUniform(SectionKey, Direction, group.ToDictionary(TrainCode, MinRunningTime))
+```
+
+Kết quả của bước này là một **báo cáo** (`SectionRunningTimeValidationReport`): danh sách
+`(SectionId, Direction)` nhất quán (đã dedupe xong, không cần làm gì thêm) và danh sách
+`(SectionId, Direction)` không nhất quán kèm bảng `TrainCode → giá trị khác nhau`. Phase 2.5 **không tự
+quyết định** giá trị nào "đúng" — chỉ báo cáo trung thực để người vận hành xác nhận đây là khác biệt hợp
+lệ (vd. đầu máy/loại tàu khác nhau chạy cùng khu gian với tốc độ kỹ thuật khác nhau) hay là lỗi nhập liệu.
+
+### 15.8 Thay đổi tối thiểu cho Domain/Engine khi có Section non-uniform (chỉ code KHI thực sự phát sinh)
+
+Nếu bước 15.7 cho thấy **mọi** `(Section, Direction)` đều nhất quán (khả năng cao với dữ liệu kỹ thuật
+thật, vì cùng loại đầu máy/đoàn tàu chạy cùng khu gian vật lý thường có cùng min running time) →
+**không cần đổi gì** trong `Domain`/`Engine` hiện tại: chỉ build thẳng `Section.MinRunningTimeMinutes`
+(kiểu dữ liệu đã có sẵn) từ kết quả dedupe, `MinimumTimetableBuilder`/`RailwayNetwork` chạy y nguyên như
+Phase 2 đã commit.
+
+Nếu phát sinh **ít nhất một** `(Section, Direction)` non-uniform → cần tách biệt running-time ở mức
+`Section + Direction + TrainService/TrainClass`, nhưng **không sửa `Section`** (giữ `Section` là network
+topology thuần túy, dùng chung cho mọi tàu — đúng tinh thần mục 1.2). Thay vào đó thêm một lớp resolve
+nhỏ ở tầng `Engine`:
+
+```text
+ISectionRunningTimeResolver
+    GetMinRunningTimeMinutes(Section section, Direction direction, TrainService service) : int
+        // Ưu tiên: override riêng theo TrainCode (hoặc TrainClass nếu sau này có) trên đúng
+        // (SectionId, Direction) → dùng giá trị đó.
+        // Không có override → fallback về Section.MinRunningTimeMinutes[direction] (giá trị đã dedupe).
+```
+
+`MinimumTimetableBuilder` nhận thêm `ISectionRunningTimeResolver` qua constructor (cùng cách với
+`IStopRules`/`IRunningTimeRules` hiện tại), gọi `resolver.GetMinRunningTimeMinutes(section,
+service.Direction, service)` thay cho `section.GetMinRunningTimeMinutes(direction)` trực tiếp.
+`UniformSectionRunningTimeResolver` (implementation mặc định) chỉ delegate thẳng ra `Section` — tương
+thích ngược 100% với toàn bộ test Phase 2 hiện có khi mọi section đều uniform.
+
+**Chưa code phần 15.8 ở thời điểm này** — chỉ code khi 15.7 chạy trên dữ liệu thật và thực sự phát hiện
+ít nhất một section non-uniform, tránh over-engineering một cấu trúc chưa có bằng chứng cần dùng.
+
+### 15.9 Output DTO — ghi lại kết quả solver vào database
+
+Sau khi engine (Phase 2 hiện tại, và sau này solver Phase 3+) tính xong trajectory, với mỗi
+`(TrainCode, JourneySequence)` phải xuất lại được:
+
+```text
+TimetableOutputRow                // ghi thẳng vào ĐÚNG 4 cột schema thật (mục 15.1), khớp kiểu SQL
+  TrainCode: string
+  JourneySequence: int
+  ArrivalTime: TimeSpan?          // time(7) — suy từ TimetableEntry.ArrivalTimeMinutes, mục 15.3
+  ArrivalDayNumber: int?          // DayNumber suy từ TimetableEntry.ArrivalTimeMinutes, mục 15.3
+  DepartureTime: TimeSpan?        // time(7) — suy từ TimetableEntry.DepartureTimeMinutes
+  DepartureDayNumber: int?        // DayNumber suy từ TimetableEntry.DepartureTimeMinutes
+  CalculatedStopDuration: int     // = TimetableEntry.StopDurationMinutes
+  RecoveryTimeFromPrev: int       // = TimetableEntry.RecoveryTimeFromPrevMinutes
+  StopType: string                // = TimetableEntry.StopType.ToString()
+  IsForcedStop: bool?             // tùy chọn — chỉ có ý nghĩa sau Phase 3 (StopType = ForcedMeet/ForcedOvertake)
+  ConflictOrDecisionRef: string?  // tùy chọn — id của Conflict/CandidateSolution sinh ra thay đổi (Phase 3+)
+```
+
+Suy `ArrivalDayNumber`/`ArrivalTime` (và tương tự cho Departure) từ `TimetableEntry.ArrivalTimeMinutes`
+(absolute minutes, mốc 0 = đầu Day 0 — mục 15.3) bằng đúng công thức nghịch đảo ở mục 15.3, rồi đổi phút
+nguyên sang `TimeSpan` khi ghi vào cột `time(7)`:
+
+```text
+DayNumber        = floor(AbsoluteMinutes ÷ 1440)                  // quy ước Day 0
+TimeOfDayMinutes = positiveModulo(AbsoluteMinutes, 1440)          // định nghĩa positiveModulo ở mục 15.3
+ArrivalTime      = TimeSpan.FromMinutes(TimeOfDayMinutes)         // phần giây luôn = 0 (domain chỉ có phút)
+```
+
+`ArrivalTime`/`ArrivalDayNumber` = NULL đúng tại `JourneySequence=1` (ga xuất phát không có Arrival);
+`DepartureTime`/`DepartureDayNumber` = NULL đúng tại `JourneySequence=N` (ga đích không có Departure) —
+đối xứng với input ở mục 15.1, và khớp với `TimetableEntry.ArrivalTimeMinutes`/`DepartureTimeMinutes`
+vốn đã là `int?` với đúng quy ước null này (mục 1.5). Tại **mọi dòng trung gian** (`1<JourneySequence<N`),
+cả 4 cột này PHẢI được ghi (overwrite) với giá trị vừa tính — đúng đối xứng với vai trò
+`IgnoredAsInput / SolverOutput` đã định nghĩa ở mục 15.1: input thì bỏ qua giá trị cũ, output thì ghi đè
+không điều kiện, không "giữ lại nếu đã có sẵn".
+
+**Đã đơn giản đi so với bản nháp trước:** vì quy ước Day 0 nội bộ (mục 2, đã có sẵn trong `Domain`) và
+quy ước Day 0 của DB thật (đã xác nhận: `DepartureDayNumber` tại ga xuất phát = 0) **giống hệt nhau**,
+output mapper **không cần** một tham số `DayNumberBase` để dịch ngược — `DayNumber` tính được ở trên
+chính là giá trị ghi thẳng vào cột `ArrivalDayNumber`/`DepartureDayNumber` của DB, không qua bước cộng/
+trừ nào nữa. (Nếu sau này có một hệ thống tiêu thụ khác dùng quy ước 1-based, phép dịch `+1` chỉ cần áp
+dụng ở đúng boundary ghi ra hệ thống đó, không lẫn vào logic tính toán nội bộ của Phase 2.5.)
+
+### 15.10 `BufferAllocator` — phase nào chịu trách nhiệm cấy recovery vào trajectory
+
+Đã có sẵn trong mục 4 (dòng ~429): *"`BufferAllocator` (Engine, Phase 2 khởi tạo + Phase 8 tối ưu) chịu
+trách nhiệm: (a) tạo phân bổ recovery-time ban đầu... (b) `SlackReallocationStrategy`..."*. Cần làm rõ
+lại cho khớp với những gì **đã thực sự implement** ở Phase 2 (đã commit) và mô hình dữ liệu vừa xác nhận:
+
+- **"Phase 2 khởi tạo" ở mục 4 KHÔNG có nghĩa `MinimumTimetableBuilder` tự rải recovery** —
+  `MinimumTimetableBuilder` (đã code, đã test, mục 15.6) chỉ tạo trajectory tối thiểu với
+  `RecoveryTimeFromPrevMinutes = 0` khắp nơi. Đây **là** trạng thái "khởi tạo" đúng nghĩa — không phải
+  giá trị tạm chờ một bước rải khác chạy tiếp ngay sau. Không có heuristic "rải đều"/"rải theo lịch sử
+  xung đột" nào chạy trong Phase 2 hiện tại.
+- **Một `BufferAllocator` thật sự** (quyết định rải `RecoveryTimeFromPrev` khác 0 ở đâu, TRƯỚC khi
+  conflict resolution chạy, để cải thiện chất lượng — Objective 6, mục 20, "độ đều của recovery") **chưa
+  được implement**, và **không bắt buộc cho tính đúng đắn** — nhưng đây **không phải một khẳng định suông
+  dựa trên "trực giác số học"** (bản nháp trước bị đúng chỉ ra là thiếu chứng minh tường minh, xem review
+  trước Phase 3): `BufferCalculator.ComputeBufferState(service, trajectory)` (đã code, đã test —
+  `src/TrainTimetable.Engine/BufferCalculator.cs`, `TrajectoryPropagatorTests.
+  InsertDelay_OnZeroRecoveryTrajectory_ConsumesUnallocatedBufferAcrossSequentialInsertsAndBlocksOverflow`)
+  tách tường minh 3 thành phần luôn cộng đúng bằng `TotalBuffer`:
+
+  ```text
+  TotalBufferMinutes = AllocatedRecoveryMinutes + ConsumedBufferMinutes + UnallocatedBufferMinutes
+  ```
+
+  trong đó `TotalBufferMinutes` là **hằng số bất biến** qua mọi lần `InsertDelay` (tính từ
+  `Σ(RunningTimeFromPrev − RecoveryTimeFromPrev + StopDuration)` trên toàn trajectory — đại lượng này
+  không đổi vì mỗi đơn vị `RecoveryTimeFromPrev` bị `InsertDelay` tiêu thì `RunningTimeFromPrev` giảm
+  đúng bằng đó, xem `TrajectoryPropagator.InsertDelay`), `AllocatedRecoveryMinutes` = tổng
+  `RecoveryTimeFromPrev` hiện còn trên trajectory, `ConsumedBufferMinutes` =
+  `trajectory.Last.CumulativeInsertedDelayMinutes` (tổng delay đã từng chèn thành công). Test đã chạy
+  đúng kịch bản bắt buộc: `TotalBuffer=20`, `RecoveryTimeFromPrev=0` khắp nơi (không có gì để
+  `BufferAllocator` cấy trước) → chèn 5 phút: `IsFeasible=true`, `UnallocatedBuffer` 20→15,
+  `Arrival(destination) <= FixedArrivalTime`; chèn thêm 12 (cộng dồn 17): `UnallocatedBuffer` →3; chèn
+  thêm 4: `IsFeasible=false` (đúng bằng chứng — không có bước nào âm thầm để `Arrival(destination)` vượt
+  `FixedArrivalTime` mà vẫn báo feasible). Đây chính là bằng chứng thực nghiệm cho khẳng định
+  **`TrajectoryPropagator.InsertDelay` xử lý đúng cả khi `RecoveryTimeFromPrevMinutes = 0` khắp nơi** —
+  không cần `BufferAllocator` cấy trước bất kỳ gì để CORRECTNESS.
+- Vậy `BufferAllocator` (rải initial + `SlackReallocationStrategy`, mục 4.2) là một cải tiến **chất
+  lượng lịch chạy** (đọc dễ hơn cho dispatcher, chừa dư địa đều hơn cho các xung đột ở nhiều điểm khác
+  nhau thay vì để 1 xung đột sớm có thể "ăn" gần hết cục buffer cuối), **không phải yêu cầu functional**.
+  Theo đúng phân công đã có ở mục 4: phần rải ban đầu (nếu làm) và `SlackReallocationStrategy` đều là
+  việc của **Phase 8** (tối ưu, sau khi đã có 1 nghiệm khả thi) — **không phải Phase 2.5**. Phase 2.5
+  (mục này) chỉ có trách nhiệm dựng đúng trajectory tối thiểu với buffer chưa phân bổ (mục 15.6) làm điểm
+  khởi đầu cho Phase 3+; **chưa** code `BufferAllocator` ở bất kỳ hình thức nào tại đây.
+
+### 15.11 Các trường còn thiếu so với `TrainService` (không suy được từ bảng hành trình)
+
+- `Priority`: bảng hành trình không có cột này → cần nguồn dữ liệu khác, hoặc mặc định tạm thời `1` cho
+  tới khi có input rõ ràng — **không suy đoán** từ `TrainCode` (vd. đoán "SE" = ưu tiên cao) vì đây là
+  business rule cần xác nhận, không phải quy luật kỹ thuật.
+- `StationTrack`/`CanMeet`/`CanOvertake`/`NumberOfTracks` của `Section`: vẫn là input độc lập, câu hỏi
+  mở 1–2 ở mục 14.2 **vẫn còn mở** — bảng hành trình chỉ cho lịch trình từng tàu, không cho năng lực
+  tránh/vượt của ga hay số đường của khu gian.
+- `RailwayNetwork.GetStationByCode(int code)`: **chưa tồn tại** trong `RailwayNetwork` đã commit (chỉ có
+  `GetStation(int sequence)`, tra theo `Sequence` chứ không theo `Code`) — cần khi code mapper thật (mục
+  15.4). Đồng thời `Station.Code` (đã commit) đang là `string` trong khi `StationCode` của DB là `int` —
+  cần quyết định giữ `string` (mapper `ToString()` khi lookup) hay đổi kiểu, để dành xác nhận khi code
+  Phase 2.5 thật, chưa tự ý đổi domain đã commit ở đây.
+
+### 15.12 Cố tình CHƯA làm ở Phase 2.5 (tránh lấn Phase 3 / lấn việc chưa có bằng chứng cần)
+
+- **Đã loại bỏ hẳn** ý tưởng bóc "existing scheduled slack/recovery" từ chênh lệch Arrival/Departure của
+  raw data (bản nháp trước) — tiền đề đó sai (mục 15.1: không có Arrival/Departure trung gian trong
+  input), không chỉ là "chưa làm".
+- **Chưa** code `BufferAllocator` dưới bất kỳ hình thức nào (kể cả một bản "rải đều" đơn giản) — theo
+  đúng phân công ở mục 15.10, đây là việc của Phase 8, không phải Phase 2.5.
+- **Chưa** tạo bảng DB mới (`SectionRunningTime` hay tương đương) — map trực tiếp tại tầng mapping/Engine
+  như mục 15.7–15.8, đúng yêu cầu.
+- **Chưa** code `ISectionRunningTimeResolver` (mục 15.8) cho tới khi 15.7 xác nhận thực sự cần.
+- **Chưa** code DB integration (đọc bảng hành trình thật / ghi output thật) hay bất kỳ phần nào của
+  Phase 3 — mục 15 hiện tại vẫn thuần là spec/thiết kế.
